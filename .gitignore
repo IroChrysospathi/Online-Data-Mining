@@ -1,1 +1,3 @@
+# Files and directories that should not be tracked by Git
+# Includes virtual environments, cache files, databases, and raw scraped data
 
