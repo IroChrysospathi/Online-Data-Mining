@@ -1,1 +1,4 @@
+# Project dependencies
+# This file defines all Python packages required to run the project.
+# Install using: pip install -r requirements.txt
 
