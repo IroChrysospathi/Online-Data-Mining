@@ -22,11 +22,7 @@ import scrapy
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-
-# -------------------------
 # helpers
-# -------------------------
-
 def clean(text):
     if text is None:
         return None
@@ -177,11 +173,7 @@ def extract_prices_from_buyblock_text(full_text: str):
 
     return current, base
 
-
-# -------------------------
 # spider
-# -------------------------
-
 class BolProductsSpider(scrapy.Spider):
     name = "bol_products"
     allowed_domains = ["bol.com"]
@@ -587,5 +579,3 @@ class BolProductsSpider(scrapy.Spider):
         )
 
         yield item
-
-        
