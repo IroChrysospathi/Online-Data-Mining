@@ -1,26 +1,31 @@
 """
-Bol.com product spider (microphones category).
+bol_products.py (RAW OUTPUT)
 
-Improvements over baseline:
-- Extract more product links reliably from listing pages (use product card selectors).
-- Follow pagination more reliably (multiple selectors + URL page fallback).
-- Better alignment on product pages:
-  - Prefer JSON-LD Product + WebPage breadcrumbs
-  - Stronger buy-box-only price extraction (avoid “other products” prices)
-  - Breadcrumb filtering: only accept real category breadcrumbs (/l/) and ignore /prijsoverzicht/
-  - Better image/brand/title fallbacks via meta tags
-  - Avoid noisy model extraction; only accept plausible model tokens
-- Adds extra fields useful for your ERD: gtin, mpn, sku, canonical_name, breadcrumb fields.
+Scrapes:
+- Run metadata (once)
+- Subcategories shown on: https://www.bol.com/nl/nl/l/microfoons/7119/
+- Product pages:
+  - product identity fields (title, brand, model, gtin, mpn, sku, canonical_name)
+  - listing fields (source_url, description, image_url)
+  - price snapshot fields (current/base/discount, stock text)
+  - review aggregate (rating + count)
+  - breadcrumbs (category + parent + url)
+
+Output is "raw JSON" per yielded item.
 """
 
 import json
 import re
+import uuid
+import subprocess
 import scrapy
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 
-# baseline funcs 
+# -------------------------
+# helpers
+# -------------------------
 
 def clean(text):
     if text is None:
@@ -30,12 +35,6 @@ def clean(text):
 
 
 def price_to_float(text):
-    """
-    Parse common European formats:
-    '€ 129,99' -> 129.99
-    '129,99' -> 129.99
-    '59.99' -> 59.99
-    """
     if not text:
         return None
     t = re.sub(r"[^\d,\.]", "", str(text))
@@ -50,7 +49,6 @@ def price_to_float(text):
 
 
 def iter_json_ld(obj):
-    """Yield dict nodes from JSON-LD (handles @graph)."""
     if isinstance(obj, dict):
         yield obj
         g = obj.get("@graph")
@@ -74,13 +72,6 @@ def canonicalize(brand, title, model=None):
 
 
 def meta_content(response, *names):
-    """
-    Return first non-empty meta content for given names.
-    Supports:
-      - meta[property="og:title"]
-      - meta[name="description"]
-      - meta[property="product:price:amount"]
-    """
     for n in names:
         v = response.css(f'meta[property="{n}"]::attr(content)').get()
         if v:
@@ -92,7 +83,6 @@ def meta_content(response, *names):
 
 
 def pick_first_price_text(texts):
-    """Pick the first plausible price-like text from a list of strings."""
     for t in texts:
         t = clean(t)
         if not t:
@@ -103,31 +93,21 @@ def pick_first_price_text(texts):
 
 
 def normalize_bad_model(model):
-    """
-    Keep only plausible model strings; reject common junk or too-long sentences.
-    """
     m = clean(model)
     if not m:
         return None
 
     low = m.lower()
-    # known garbage we saw from loose regex matches
     if low in {"ditiontype", "editiontype", "conditiontype"}:
         return None
-
-    # too long 
     if len(m) > 30 and " " in m:
         return None
-
-    # too short
     if len(m) < 2:
         return None
-
     return m
 
 
 def strip_tracking(url: str) -> str:
-    """Remove bol tracking params like cid, bltgh, etc."""
     try:
         p = urlparse(url)
         q = parse_qs(p.query)
@@ -141,17 +121,67 @@ def strip_tracking(url: str) -> str:
 
 
 def looks_like_category_url(url: str) -> bool:
-    """Accept only category URLs (bol lists often contain /l/). Reject price overview."""
     if not url:
         return False
     u = url.lower()
     if "/prijsoverzicht/" in u:
         return False
-    # bol category/list pages often have /l/ in path
     return "/l/" in u
 
 
+def get_git_commit_hash() -> str | None:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
+        return out.decode("utf-8", errors="ignore").strip() or None
+    except Exception:
+        return None
+
+
+def parse_discount_percent(text: str) -> float | None:
+    if not text:
+        return None
+    m = re.search(r"(\d{1,2})\s*%\s*(korting|discount)", text, re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def extract_prices_from_buyblock_text(full_text: str):
+    if not full_text:
+        return None, None
+
+    candidates = re.findall(r"€\s*\d[\d\.\s]*[,\.\d]{0,3}\d", full_text)
+    if not candidates:
+        candidates = re.findall(r"\b\d[\d\.\s]*[,\.\d]{0,3}\d\b", full_text)
+
+    vals = []
+    for c in candidates:
+        v = price_to_float(c)
+        if v is not None:
+            vals.append(v)
+
+    if not vals:
+        return None, None
+
+    current = vals[0]
+    base = vals[1] if len(vals) > 1 else None
+
+    if len(vals) >= 2:
+        current2 = min([x for x in vals if x > 0], default=current)
+        base2 = max([x for x in vals if x > 0], default=base or current)
+        if base2 >= current2:
+            current, base = current2, base2
+
+    return current, base
+
+
+# -------------------------
 # spider
+# -------------------------
+
 class BolProductsSpider(scrapy.Spider):
     name = "bol_products"
     allowed_domains = ["bol.com"]
@@ -170,23 +200,42 @@ class BolProductsSpider(scrapy.Spider):
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0 Safari/537.36"
         ),
-        # 200 limits = number of downloaded pages 
         "CLOSESPIDER_PAGECOUNT": 200,
     }
 
-    # listing pages
+    crawler_version = "bol_products/RAW-2.0"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scrape_run_id = str(uuid.uuid4())
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.git_commit_hash = get_git_commit_hash()
+        self._seed_emitted = False
+
+    def start_requests(self):
+        # Emit run metadata once
+        yield {
+            "type": "run",
+            "scrape_run_id": self.scrape_run_id,
+            "started_at": self.started_at,
+            "git_commit_hash": self.git_commit_hash,
+            "crawler_version": self.crawler_version,
+            "notes": "bol microphones crawl",
+        }
+
+        for url in self.start_urls:
+            yield scrapy.Request(url, callback=self.parse)
+
     def parse(self, response):
-        self.logger.info(
-            "LISTING status=%s title=%s url=%s",
-            response.status,
-            clean(response.css("title::text").get()),
-            response.url,
-        )
+        self.logger.info("LISTING status=%s url=%s", response.status, response.url)
 
-        # product-card title links (more reliable than href contains)
+        # Emit subcategories (only once, from the seed page)
+        if not self._seed_emitted and "microfoons/7119" in response.url:
+            self._seed_emitted = True
+            yield from self.parse_subcategories(response)
+
+        # Product links
         links = response.css('a[data-test="product-title"]::attr(href)').getall()
-
-        # fallbacks (bol sometimes changes structure)
         if not links:
             links = response.css('li[data-test="product-item"] a[href*="/nl/nl/p/"]::attr(href)').getall()
         if not links:
@@ -194,25 +243,22 @@ class BolProductsSpider(scrapy.Spider):
 
         links = [strip_tracking(response.urljoin(h)) for h in links if h]
         links = list(dict.fromkeys(links))
-        self.logger.info("Found %d product links", len(links))
 
         for url in links:
             yield response.follow(url, callback=self.parse_product)
 
-        # pagination: try common next links; if missing, try URL-based ?page=
+        # Pagination
         next_page = (
             response.css('a[rel="next"]::attr(href)').get()
             or response.css('a[data-test="pagination-next"]::attr(href)').get()
             or response.css('a[aria-label*="Volgende"]::attr(href)').get()
             or response.css('a[aria-label*="Next"]::attr(href)').get()
         )
-
         if next_page:
             yield response.follow(next_page, callback=self.parse)
             return
 
-        # URL-based fallback: if a page parameter exists, increment it
-        # if it doesn't, add page=2 as a last resort 
+        # Fallback ?page=
         p = urlparse(response.url)
         q = parse_qs(p.query)
         if "page" in q:
@@ -224,21 +270,60 @@ class BolProductsSpider(scrapy.Spider):
             except Exception:
                 pass
         else:
-            # only add page=2 for the first page (avoid looping weird URLs)
             if response.url.rstrip("/").endswith("/7119"):
                 q["page"] = ["2"]
                 url2 = urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
                 yield response.follow(url2, callback=self.parse)
 
-    # product pages
-    def parse_product(self, response):
-        item = {
-            "shop": "bol",
-            "category_seed": "microfoons/7119",
-            "source_url": strip_tracking(response.url),
-            "scraped_at": datetime.now(timezone.utc).isoformat(),
+    def parse_subcategories(self, response):
+        """
+        Scrape the "subcategory chips" on:
+        https://www.bol.com/nl/nl/l/microfoons/7119/
+        """
+        raw = response.css('a[href*="/nl/nl/l/"]::attr(href)').getall()
+        urls = []
+        for h in raw:
+            u = strip_tracking(response.urljoin(h))
+            if looks_like_category_url(u):
+                urls.append(u)
 
-            # PRODUCT-ish fields
+        urls = list(dict.fromkeys(urls))
+        children = [u for u in urls if "microfoon" in u.lower()]
+        candidates = children or urls
+
+        emitted = set()
+        for u in candidates:
+            if u in emitted:
+                continue
+            emitted.add(u)
+
+            path = urlparse(u).path
+            frag = path.strip("/").split("/")[-2:]
+            needle = "/".join(frag) if frag else path
+
+            label = clean(response.css(f'a[href*="{needle}"]::text').get())
+            label = label or clean(response.css(f'a[href*="{needle}"] span::text').get())
+
+            yield {
+                "type": "subcategory",
+                "scrape_run_id": self.scrape_run_id,
+                "seed_url": strip_tracking(response.url),
+                "name": label,
+                "url": u,
+            }
+
+    def parse_product(self, response):
+        scraped_at = datetime.now(timezone.utc).isoformat()
+        source_url = strip_tracking(response.url)
+
+        item = {
+            "type": "product",
+            "scrape_run_id": self.scrape_run_id,
+            "scraped_at": scraped_at,
+            "source_url": source_url,
+            "seed_category": "microfoons/7119",
+
+            # product identity
             "title": None,
             "brand": None,
             "model": None,
@@ -247,29 +332,32 @@ class BolProductsSpider(scrapy.Spider):
             "mpn": None,
             "sku": None,
 
-            # Listing-ish fields
+            # content
             "description": None,
             "image_url": None,
 
-            # Price snapshot-ish fields
+            # price snapshot
             "currency": "EUR",
-            "price": None,
-            "price_raw": None,
-            "availability_raw": None,
+            "current_price": None,
+            "base_price": None,
+            "discount_amount": None,
+            "discount_percent": None,
+            "price_text": None,
             "in_stock": None,
+            "stock_status_text": None,
 
-            # Review-ish fields
+            # review aggregate
             "rating_value": None,
-            "review_count": None,
             "rating_scale": 5,
+            "review_count": None,
 
-            # Category-ish fields
+            # breadcrumbs
             "breadcrumb_category": None,
             "breadcrumb_parent": None,
             "breadcrumb_url": None,
         }
 
-        # JSON-LD extraction (Product + BreadcrumbList/WebPage)
+        # JSON-LD
         blocks = response.css('script[type="application/ld+json"]::text').getall()
         nodes = []
         for b in blocks:
@@ -284,7 +372,6 @@ class BolProductsSpider(scrapy.Spider):
 
         product_ld = None
         breadcrumb_ld = None
-
         for n in nodes:
             t = n.get("@type")
             if t == "Product" or (isinstance(t, list) and "Product" in t):
@@ -292,7 +379,6 @@ class BolProductsSpider(scrapy.Spider):
             if t == "BreadcrumbList" or (isinstance(t, list) and "BreadcrumbList" in t):
                 breadcrumb_ld = breadcrumb_ld or n
 
-        # Product JSON-LD
         if product_ld:
             item["title"] = clean(product_ld.get("name"))
             item["description"] = clean(product_ld.get("description"))
@@ -303,7 +389,6 @@ class BolProductsSpider(scrapy.Spider):
             elif isinstance(brand, str):
                 item["brand"] = clean(brand)
 
-            # IDs
             for k in ("gtin13", "gtin14", "gtin12", "gtin8", "gtin"):
                 v = product_ld.get(k)
                 if v:
@@ -314,7 +399,6 @@ class BolProductsSpider(scrapy.Spider):
             if product_ld.get("sku"):
                 item["sku"] = clean(product_ld.get("sku"))
 
-            # model 
             if product_ld.get("model"):
                 m = product_ld.get("model")
                 if isinstance(m, dict):
@@ -322,37 +406,32 @@ class BolProductsSpider(scrapy.Spider):
                 else:
                     item["model"] = clean(m)
 
-            # image
             img = product_ld.get("image")
             if isinstance(img, list) and img:
                 item["image_url"] = clean(img[0])
             elif isinstance(img, str):
                 item["image_url"] = clean(img)
 
-            # offers
             offers = product_ld.get("offers")
             if isinstance(offers, list) and offers:
                 offers = offers[0]
             if isinstance(offers, dict):
                 p = offers.get("price")
                 if p is not None:
-                    item["price_raw"] = clean(p)
-                    item["price"] = price_to_float(p)
+                    item["price_text"] = clean(p)
+                    item["current_price"] = price_to_float(p)
 
                 av = offers.get("availability")
                 if isinstance(av, str):
-                    item["availability_raw"] = av
+                    item["stock_status_text"] = av
                     item["in_stock"] = ("InStock" in av)
 
-            # rating
             agg = product_ld.get("aggregateRating")
             if isinstance(agg, dict):
-                rv = agg.get("ratingValue")
-                rc = agg.get("reviewCount") or agg.get("ratingCount")
-                item["rating_value"] = clean(rv)
-                item["review_count"] = clean(rc)
+                item["rating_value"] = clean(agg.get("ratingValue"))
+                item["review_count"] = clean(agg.get("reviewCount") or agg.get("ratingCount"))
 
-        # BreadcrumbList JSON-LD (best for categories when available)
+        # BreadcrumbList JSON-LD
         if breadcrumb_ld and isinstance(breadcrumb_ld.get("itemListElement"), list):
             names = []
             urls = []
@@ -364,16 +443,14 @@ class BolProductsSpider(scrapy.Spider):
                     urls.append(clean(it) if isinstance(it, str) else clean((it or {}).get("@id")))
             names = [n for n in names if n]
             urls = [u for u in urls if u]
-            # last breadcrumb should be category or product name depending on page
-            # the last *category* URL that looks like /l/
+
             cat_candidates = [(n, u) for n, u in zip(names, urls) if u and looks_like_category_url(u)]
             if cat_candidates:
                 item["breadcrumb_category"], item["breadcrumb_url"] = cat_candidates[-1]
                 if len(cat_candidates) >= 2:
                     item["breadcrumb_parent"] = cat_candidates[-2][0]
 
-        # Visual/HTML fallbacks (strong alignment)
-        # title: h1, else og:title, else <title>
+        # HTML fallbacks
         if not item["title"]:
             item["title"] = (
                 clean(response.css("h1::text").get())
@@ -383,7 +460,6 @@ class BolProductsSpider(scrapy.Spider):
             if item["title"]:
                 item["title"] = re.sub(r"\s*\|\s*bol\s*$", "", item["title"], flags=re.IGNORECASE).strip()
 
-        # brand: brand link/text, else meta
         if not item["brand"]:
             item["brand"] = (
                 clean(response.css('[data-test="brandLink"]::text').get())
@@ -391,39 +467,51 @@ class BolProductsSpider(scrapy.Spider):
                 or meta_content(response, "product:brand")
             )
 
-        # image: og:image is very reliable on bol
         if not item["image_url"]:
             item["image_url"] = meta_content(response, "og:image")
 
-        # description: meta fallback
         if not item["description"]:
             item["description"] = meta_content(response, "description", "og:description")
 
-        # price: restrict to buy box only; then meta
-        if item["price"] is None:
-            buy_block = response.css('[data-test="buy-block"], [data-test="buybox"], [data-test="buyBox"]')
+        # Price parsing from buybox
+        buy_block = response.css('[data-test="buy-block"], [data-test="buybox"], [data-test="buyBox"]')
+        buy_text = clean(" ".join(buy_block.css("*::text").getall())) if buy_block else None
+
+        if item["current_price"] is None:
             price_text = None
             if buy_block:
                 candidates = buy_block.css('[data-test*="price"] *::text').getall()
                 price_text = pick_first_price_text(candidates)
-
             price_text = price_text or meta_content(response, "product:price:amount", "og:price:amount")
-
             if not price_text:
                 price_text = clean(response.css('[itemprop="price"]::attr(content)').get()) or clean(
                     response.css('[itemprop="price"]::text').get()
                 )
 
-            item["price_raw"] = item["price_raw"] or price_text
-            item["price"] = price_to_float(price_text)
+            item["price_text"] = item["price_text"] or price_text
+            item["current_price"] = price_to_float(price_text)
 
-        # availability (cheap heuristic, keep raw buy-box text)
-        if not item["availability_raw"] or item["in_stock"] is None:
-            buy_text = clean(" ".join(response.css(
-                '[data-test="buy-block"], [data-test="buybox"], [data-test="buyBox"] *::text'
-            ).getall()))
+        if buy_text:
+            cur2, base2 = extract_prices_from_buyblock_text(buy_text)
+            if item["current_price"] is None and cur2 is not None:
+                item["current_price"] = cur2
+            if base2 is not None:
+                item["base_price"] = base2
+
+            dp = parse_discount_percent(buy_text)
+            if dp is not None:
+                item["discount_percent"] = dp
+
+        if item["base_price"] is not None and item["current_price"] is not None:
+            if item["base_price"] >= item["current_price"]:
+                item["discount_amount"] = round(item["base_price"] - item["current_price"], 2)
+                if item["discount_percent"] is None and item["base_price"] > 0:
+                    item["discount_percent"] = round((item["discount_amount"] / item["base_price"]) * 100, 2)
+
+        # Availability
+        if not item["stock_status_text"] or item["in_stock"] is None:
             if buy_text:
-                item["availability_raw"] = item["availability_raw"] or buy_text
+                item["stock_status_text"] = item["stock_status_text"] or buy_text
                 if item["in_stock"] is None:
                     low = buy_text.lower()
                     if any(x in low for x in ["niet leverbaar", "uitverkocht", "tijdelijk niet beschikbaar"]):
@@ -431,7 +519,7 @@ class BolProductsSpider(scrapy.Spider):
                     elif any(x in low for x in ["morgen in huis", "op voorraad", "voor 23:59", "leverbaar"]):
                         item["in_stock"] = True
 
-        # ratings: visible fallback if JSON-LD missing
+        # Ratings fallback
         if not item["rating_value"] or not item["review_count"]:
             rating_text = clean(" ".join(response.css(
                 '[data-test*="rating"] *::text, a[href*="reviews"] *::text, [href*="#review"] *::text'
@@ -445,20 +533,14 @@ class BolProductsSpider(scrapy.Spider):
                 if m:
                     item["review_count"] = m.group(1)
 
-        # Breadcrumb HTML fallback (filtered)
-        # only accept true category crumbs (/l/) and ignore /prijsoverzicht/
+        # Breadcrumb HTML fallback
         if not item["breadcrumb_url"] or not looks_like_category_url(item["breadcrumb_url"]):
-            crumb_texts = response.css(
-                'nav a[href]::text, ol a[href]::text, a[data-test*="breadcrumb"]::text'
-            ).getall()
-            crumb_hrefs = response.css(
-                'nav a[href]::attr(href), ol a[href]::attr(href), a[data-test*="breadcrumb"]::attr(href)'
-            ).getall()
+            crumb_texts = response.css('nav a[href]::text, ol a[href]::text, a[data-test*="breadcrumb"]::text').getall()
+            crumb_hrefs = response.css('nav a[href]::attr(href), ol a[href]::attr(href), a[data-test*="breadcrumb"]::attr(href)').getall()
 
             crumb_texts = [clean(c) for c in crumb_texts if clean(c)]
             crumb_hrefs = [strip_tracking(response.urljoin(h)) for h in crumb_hrefs if h]
 
-            # pair them by index, filter to category URLs
             pairs = []
             for i in range(min(len(crumb_texts), len(crumb_hrefs))):
                 nm = crumb_texts[i]
@@ -471,7 +553,7 @@ class BolProductsSpider(scrapy.Spider):
                 if len(pairs) >= 2:
                     item["breadcrumb_parent"] = pairs[-2][0]
 
-        # identifier fallbacks (only if missing)
+        # Identifier fallbacks
         if not item["gtin"] or not item["mpn"] or not item["model"]:
             body_text = clean(" ".join(response.css("body *::text").getall())) or ""
 
@@ -499,11 +581,11 @@ class BolProductsSpider(scrapy.Spider):
                     item["model"] = m.group(2)
 
         item["model"] = normalize_bad_model(item["model"])
-
-        # canonical name (for PRODUCT.canonical_name NOT NULL)
         item["canonical_name"] = (
             canonicalize(item["brand"], item["title"], item["model"])
             or canonicalize(None, item["title"], None)
         )
 
         yield item
+
+        

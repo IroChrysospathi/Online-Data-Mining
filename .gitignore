@@ -1,3 +1,23 @@
 # Files and directories that should not be tracked by Git
 # Includes virtual environments, cache files, databases, and raw scraped data
 
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+**/.DS_Store
