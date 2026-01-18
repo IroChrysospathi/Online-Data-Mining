@@ -23,11 +23,7 @@ import scrapy
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-
-# ----------------------------
 # Helpers
-# ----------------------------
-
 def iso_utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -152,10 +148,7 @@ class BolSupportSpider(scrapy.Spider):
         self.product_rows = self._load_products(self.input_file)
         self.logger.info(f"Loaded {len(self.product_rows)} product URLs from input_file={self.input_file}")
 
-    # ----------------------------
-    # Input loading (your schema)
-    # ----------------------------
-
+    # Input loading (erd schema)
     def _load_products(self, path):
         rows = []
 
@@ -228,10 +221,7 @@ class BolSupportSpider(scrapy.Spider):
         self.logger.error(f"Unsupported input_file extension: {ext}")
         return rows
 
-    # ----------------------------
     # Crawl
-    # ----------------------------
-
     def start_requests(self):
         if not self.product_rows:
             self.logger.error("No products loaded. Check input_file (type=product and source_url).")
@@ -290,18 +280,14 @@ class BolSupportSpider(scrapy.Spider):
                 meta={"listing_id": row["listing_id"]},
             )
 
-    # ----------------------------
     # Product page parsing -> CUSTOMER_SERVICE + EXPERT_SUPPORT
-    # ----------------------------
-
     def parse_product(self, response):
         listing_id = response.meta.get("listing_id")
         scraped_at = iso_utc_now()
 
         full_text = clean(" ".join(response.css("body *::text").getall())) or ""
 
-        # -------- CUSTOMER_SERVICE fields --------
-
+        # CUSTOMER_SERVICE fields
         shipping_included = None
         if text_has_any(full_text, ["gratis verzending", "gratis bezorging", "gratis geleverd"]):
             shipping_included = True
@@ -370,7 +356,7 @@ class BolSupportSpider(scrapy.Spider):
         if customer_service_url is None:
             customer_service_url = "https://www.bol.com/nl/nl/klantenservice/"
 
-        # Emit CUSTOMER_SERVICE item (ONLY your columns)
+        # Emit CUSTOMER_SERVICE item (ONLY erd columns)
         yield {
             "type": "customer_service",
             "competitor_id": self.competitor_id,
@@ -388,9 +374,8 @@ class BolSupportSpider(scrapy.Spider):
             "customer_service_url": customer_service_url,
         }
 
-        # -------- EXPERT_SUPPORT fields (product-aligned heuristic) --------
+        # EXPERT_SUPPORT fields (product-aligned heuristic) 
         # We derive from the PDP itself (seller responsibility + contact/help wording).
-
         # in_store_support_available: bol has no stores
         in_store_support_available = False
 
