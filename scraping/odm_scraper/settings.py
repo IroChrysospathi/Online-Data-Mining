@@ -23,3 +23,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0 Safari/537.36"
 )
+
+ITEM_PIPELINES = {
+    "odm_scraper.pipelines.InitDbPipeline": 100,
+}
