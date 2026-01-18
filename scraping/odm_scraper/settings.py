@@ -24,6 +24,11 @@ USER_AGENT = (
     "Chrome/120.0 Safari/537.36"
 )
 
+DOWNLOADER_MIDDLEWARES = {
+    "odm_scraper.middlewares.BrightDataProxyMiddleware": 610,
+}
+
 ITEM_PIPELINES = {
     "odm_scraper.pipelines.InitDbPipeline": 100,
 }
+
