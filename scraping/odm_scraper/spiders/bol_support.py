@@ -9,10 +9,10 @@ Exports:
 2) EXPERT_SUPPORT (per listing) -> type="expert_support"
 
 IMPORTANT:
-- CUSTOMER_SERVICE item contains ONLY the CUSTOMER_SERVICE columns you specified.
+- CUSTOMER_SERVICE item contains ONLY the CUSTOMER_SERVICE columns specified.
 - EXPERT_SUPPORT item contains ONLY the EXPERT_SUPPORT columns required (plus listing_id for alignment).
 
-You will build the DB later; for now we just export JSON items.
+JSON items will be exported.
 """
 
 import csv
