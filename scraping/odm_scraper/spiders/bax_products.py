@@ -119,6 +119,17 @@ def looks_like_product_url(url: str) -> bool:
     return len(parts) >= 2
 
 
+def should_follow_url(url: str) -> bool:
+    if not url:
+        return False
+    u = url.lower()
+    if "/blog/" in u:
+        return False
+    if any(x in u for x in ["/notify-product-in-stock/", "/wishlist", "/checkout", "/basket", "/login", "/account"]):
+        return False
+    return True
+
+
 def get_git_commit_hash() -> str | None:
     try:
         out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
@@ -168,7 +179,7 @@ def extract_prices_from_buyblock_text(full_text: str):
     return current, base
 
 
-def extract_itemlist_urls(nodes):
+def extract_itemlist_urls(nodes, only_product: bool = False):
     urls = []
     for n in nodes:
         t = n.get("@type")
@@ -180,8 +191,23 @@ def extract_itemlist_urls(nodes):
                 if isinstance(el, dict):
                     url = el.get("url")
                     item = el.get("item")
+                    el_type = el.get("@type")
                     if not url and isinstance(item, dict):
-                        url = item.get("url")
+                        url = item.get("url") or item.get("@id")
+
+                    if only_product:
+                        item_type = None
+                        if isinstance(item, dict):
+                            item_type = item.get("@type")
+                        types = []
+                        for v in (el_type, item_type):
+                            if isinstance(v, list):
+                                types.extend(v)
+                            elif isinstance(v, str):
+                                types.append(v)
+                        if not any(t == "Product" for t in types):
+                            continue
+
                     if isinstance(url, str):
                         urls.append(url)
     return urls
@@ -254,36 +280,71 @@ class BaxProductsSpider(scrapy.Spider):
                 product_ld = n
                 break
 
+        itemlist_product_urls = extract_itemlist_urls(nodes, only_product=True)
+        product_tile_nodes = response.css(
+            '[itemtype*="Product"], [data-product-id], [data-sku], [data-test*="product"]'
+        )
+
+        has_pagination = bool(
+            response.css('a[rel="next"], a[aria-label*="Volgende"], a[aria-label*="Next"], a[data-test*="pagination"]')
+            .get()
+        )
+
         og_type = (meta_content(response, "og:type") or "").lower()
         is_product_page = False
         if "product" in og_type:
             is_product_page = True
         elif product_ld and (
-            response.css('[itemprop="price"], meta[property="product:price:amount"], [itemtype*="Product"]').get()
+            response.css('[itemprop="price"], meta[property="product:price:amount"]').get()
+            or response.css('form[action*="cart"], [data-test*="add-to-cart"]').get()
+            or (isinstance(product_ld.get("offers"), dict) and product_ld["offers"].get("price"))
         ):
             is_product_page = True
+
+        is_listing = not is_product_page and (
+            len(itemlist_product_urls) >= 5 or len(product_tile_nodes) >= 6 or has_pagination
+        )
 
         if is_product_page:
             yield from self.parse_product(response)
             return
 
-        links = extract_itemlist_urls(nodes)
+        links = itemlist_product_urls
+        listing_links = []
+        if not links:
+            listing_links = extract_itemlist_urls(nodes, only_product=False)
 
         # HTML fallback selectors
         if not links:
             links = response.css(
-                'a[href*="/microfoon"]::attr(href), '
-                'a[data-test*="product"]::attr(href), '
-                'li[class*="product"] a[href]::attr(href), '
-                'a[href*="/microfoons/"]::attr(href)'
+                '[itemtype*="Product"] a[href]::attr(href), '
+                '[data-product-id] a[href]::attr(href), '
+                '[data-sku] a[href]::attr(href), '
+                '[data-test*="product"] a[href]::attr(href), '
+                'li[class*="product"] a[href]::attr(href)'
             ).getall()
 
         links = [strip_tracking(response.urljoin(h)) for h in links if h]
-        links = [u for u in links if looks_like_product_url(u)]
+        links = [u for u in links if looks_like_product_url(u) and should_follow_url(u)]
         links = list(dict.fromkeys(links))
 
         for url in links:
-            yield response.follow(url, callback=self.parse_product)
+            yield response.follow(url, callback=self.parse)
+
+        if not links:
+            if not listing_links:
+                listing_links = response.css(
+                    'a[href*="/microfoon"]::attr(href), '
+                    'a[href*="/microfoons"]::attr(href), '
+                    'a[data-test*="category"]::attr(href)'
+                ).getall()
+
+            listing_links = [strip_tracking(response.urljoin(h)) for h in listing_links if h]
+            listing_links = [u for u in listing_links if should_follow_url(u) and u != response.url]
+            listing_links = list(dict.fromkeys(listing_links))
+
+            for url in listing_links:
+                yield response.follow(url, callback=self.parse)
 
         # Pagination
         next_page = (

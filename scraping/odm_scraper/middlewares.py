@@ -10,6 +10,10 @@ Responsibilities:
 from __future__ import annotations
 
 import os
+from typing import Optional
+
+import requests
+from scrapy.http import HtmlResponse
 
 
 def _build_proxy_url() -> str | None:
@@ -42,3 +46,48 @@ class BrightDataProxyMiddleware:
             return None
         request.meta["proxy"] = self.proxy_url
         return None
+
+
+class BrightDataUnlockerAPIMiddleware:
+    def __init__(self, token: Optional[str], zone: Optional[str]):
+        self.token = token
+        self.zone = zone
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        token = os.getenv("BRIGHTDATA_TOKEN")
+        zone = os.getenv("BRIGHTDATA_ZONE")
+        return cls(token, zone)
+
+    def process_request(self, request, spider):
+        if not self.token or not self.zone:
+            return None
+
+        payload = {
+            "zone": self.zone,
+            "url": request.url,
+            "format": "raw",
+            "method": request.method,
+        }
+
+        try:
+            resp = requests.post(
+                "https://api.brightdata.com/request",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=60,
+            )
+        except Exception as exc:
+            spider.logger.warning("brightdata unlocker error url=%s err=%s", request.url, exc)
+            return None
+
+        return HtmlResponse(
+            url=request.url,
+            status=resp.status_code,
+            body=resp.content,
+            encoding=resp.encoding or "utf-8",
+            request=request,
+        )

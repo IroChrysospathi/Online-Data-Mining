@@ -1,0 +1,2 @@
+[
+{"type": "run", "scrape_run_id": "4e619368-fec5-42b6-a701-610e6505ffca", "started_at": "2026-01-19T12:59:40.792655+00:00", "git_commit_hash": "c2c82c70f8cab4bbb376cded2843cb0497b0f878", "crawler_version": "bax_products/RAW-1.0", "notes": "bax microphones crawl"}

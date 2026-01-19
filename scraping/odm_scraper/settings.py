@@ -25,10 +25,10 @@ USER_AGENT = (
 )
 
 DOWNLOADER_MIDDLEWARES = {
+    "odm_scraper.middlewares.BrightDataUnlockerAPIMiddleware": 540,
     "odm_scraper.middlewares.BrightDataProxyMiddleware": 610,
 }
 
 ITEM_PIPELINES = {
     "odm_scraper.pipelines.InitDbPipeline": 100,
 }
-
