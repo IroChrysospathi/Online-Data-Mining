@@ -1,0 +1,3 @@
+[
+{"type": "run", "scrape_run_id": "19712415-8848-446d-9757-16ec5b685893", "started_at": "2026-01-20T01:27:54.163984+00:00", "git_commit_hash": "cdb0fa0d6e923bd5371d2b5962036abe810866fc", "crawler_version": "bol_products/RAW-2.1-brightdata-input", "notes": "bol crawl (category fallback OR bax-title search input)", "brightdata_mode": "proxy", "bax_json_path": null, "max_titles": 50}
+]
