@@ -1,16 +1,3 @@
-"""
-bol_products.py (RAW OUTPUT) - UPDATED + DEBUG DUMP
-
-What’s new vs your original:
-- Enforces Bright Data usage (assignment requirement) and records brightdata_mode in run metadata
-- Optional input file with Bax product titles (JSON array or JSONL). If provided: searches Bol per title
-- If no Bax file: falls back to category crawl (microfoons/7119)
-- Adds debug HTML dump when listing/search pages look blocked (403/429/503 or consent/bot pages)
-  -> saves to ./debug/bol_products_<label>_<status>.html so you can open and see what Bol returned
-
-Works with your existing middleware without changes.
-"""
-
 from __future__ import annotations
 
 import json
@@ -26,6 +13,73 @@ import scrapy
 
 
 # -------------------------
+# category alignment keywords
+# -------------------------
+
+ALLOWED_CATEGORY_KEYWORDS = {
+    "microfoons",
+    "studiomicrofoon",
+    "live-microfoon",
+    "draadloze-microfoon",
+    "usb-microfoon",
+    "multimedia-av-microfoon",
+    "zang-microfoon",
+    "microfoon-opnameset",
+}
+
+PRIORITY_CATEGORY_KEYWORDS = [
+    "studiomicrofoon",
+    "live-microfoon",
+    "draadloze-microfoon",
+    "usb-microfoon",
+    "multimedia-av-microfoon",
+    "zang-microfoon",
+    "microfoon-opnameset",
+]
+
+EXCLUDED_CATEGORY_KEYWORDS = {
+    "accessoire",
+    "accessoires",
+    "toebehoren",
+    "onderdeel",
+    "onderdelen",
+    "statieven",
+    "statief",
+    "kabel",
+    "kabels",
+    "clip",
+    "clips",
+    "klem",
+    "klemmen",
+    "windkap",
+    "windkappen",
+    "popfilter",
+    "popfilters",
+    "capsule",
+    "capsules",
+    "shockmount",
+    "shockmounts",
+    "pistoolgreep",
+    "pistoolgrepen",
+    "opbergtassen",
+    "hoezen",
+    "flightcase",
+    "flightcases",
+    "accu",
+    "lader",
+    "laders",
+    "booster",
+    "boosters",
+    "reflectiefilter",
+    "reflectiefilters",
+    "voorversterker",
+    "voorversterkers",
+    "vocal-effect",
+    "vocal-effecten",
+}
+
+
+# -------------------------
 # helpers
 # -------------------------
 
@@ -37,13 +91,68 @@ def clean(text):
 
 
 def brightdata_mode() -> str:
-    # Unlocker has priority if token+zone are set (your middleware returns a Response)
+    # Unlocker has priority if token+zone are set
     if os.getenv("BRIGHTDATA_TOKEN") and os.getenv("BRIGHTDATA_ZONE"):
         return "unlocker_api"
-    # Proxy mode if full proxy or username+password exist
-    if os.getenv("BRIGHTDATA_PROXY") or (os.getenv("BRIGHTDATA_USERNAME") and os.getenv("BRIGHTDATA_PASSWORD")):
+
+    # Proxy mode: either full proxy URL, or user/pass + host/port
+    if os.getenv("BRIGHTDATA_PROXY"):
         return "proxy"
+    if (
+        os.getenv("BRIGHTDATA_USERNAME")
+        and os.getenv("BRIGHTDATA_PASSWORD")
+        and os.getenv("BRIGHTDATA_HOST")
+        and os.getenv("BRIGHTDATA_PORT")
+    ):
+        return "proxy"
+
     return "disabled"
+
+
+def build_proxy_url() -> str | None:
+    """
+    Builds proxy URL from env vars.
+    Supports:
+      - BRIGHTDATA_PROXY  (full url)
+      - BRIGHTDATA_USERNAME / BRIGHTDATA_PASSWORD / BRIGHTDATA_HOST / BRIGHTDATA_PORT
+    """
+    p = os.getenv("BRIGHTDATA_PROXY")
+    if p:
+        return p
+
+    user = os.getenv("BRIGHTDATA_USERNAME")
+    pwd = os.getenv("BRIGHTDATA_PASSWORD")
+    host = os.getenv("BRIGHTDATA_HOST")
+    port = os.getenv("BRIGHTDATA_PORT")
+    if user and pwd and host and port:
+        return f"http://{user}:{pwd}@{host}:{port}"
+
+    return None
+
+
+def apply_brightdata_meta(request: scrapy.Request) -> scrapy.Request:
+    """
+    Adds request.meta hints for Bright Data usage.
+    - In proxy mode: sets request.meta['proxy'] so Scrapy uses it.
+    - In unlocker_api mode: sets request.meta['brightdata'] for middleware (if any).
+    """
+    mode = brightdata_mode()
+    if mode == "proxy":
+        proxy_url = build_proxy_url()
+        if proxy_url:
+            request.meta["proxy"] = proxy_url
+        request.meta["brightdata_mode"] = "proxy"
+    elif mode == "unlocker_api":
+        # Many Bright Data unlocker middlewares look for a meta config block
+        request.meta["brightdata_mode"] = "unlocker_api"
+        request.meta.setdefault("brightdata", {})
+        request.meta["brightdata"].update({
+            "token_env": "BRIGHTDATA_TOKEN",
+            "zone_env": "BRIGHTDATA_ZONE",
+        })
+    else:
+        request.meta["brightdata_mode"] = "disabled"
+    return request
 
 
 def price_to_float(text):
@@ -123,12 +232,9 @@ def strip_tracking(url: str) -> str:
     try:
         p = urlparse(url)
         q = parse_qs(p.query)
-
-        # bol-ish tracking params you were already dropping
         for k in list(q.keys()):
             if k.lower() in {"cid", "bltgh", "bltg", "blt", "ref", "promo"}:
                 q.pop(k, None)
-
         new_query = urlencode(q, doseq=True)
         return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
     except Exception:
@@ -205,6 +311,88 @@ def looks_blocked_title(title: str | None) -> bool:
     return any(n in t for n in needles)
 
 
+def _norm_tokens(text: str | None) -> set[str]:
+    if not text:
+        return set()
+    s = text.lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    parts = [p for p in s.split() if p]
+    stop = {"de", "het", "een", "and", "the", "with", "voor", "met"}
+    return {p for p in parts if p not in stop and len(p) > 1}
+
+
+def _keyword_hit(haystack: str, keywords: set[str]) -> bool:
+    hs = (haystack or "").lower()
+    for kw in keywords:
+        if kw in hs:
+            return True
+        if "-" in kw and kw.replace("-", " ") in hs:
+            return True
+    return False
+
+
+def should_keep_item(item: dict) -> tuple[bool, str]:
+    query_title = item.get("query_title")
+
+    blob_parts = [
+        item.get("title"),
+        item.get("breadcrumb_category"),
+        item.get("breadcrumb_parent"),
+        item.get("breadcrumb_url"),
+        item.get("source_url"),
+    ]
+    blob = " ".join([p for p in blob_parts if p]).lower()
+
+    if _keyword_hit(blob, EXCLUDED_CATEGORY_KEYWORDS):
+        return False, "excluded_keyword"
+
+    if not query_title:
+        if _keyword_hit(blob, ALLOWED_CATEGORY_KEYWORDS):
+            return True, "allowed_keyword"
+        return False, "not_in_allowed_categories"
+
+    return True, "search_mode_keep"
+
+
+def extract_query_from_bax_title(title: str | None) -> str | None:
+    t = clean(title)
+    if not t:
+        return None
+    toks = t.split()
+    if not toks:
+        return t
+
+    brand = toks[0]
+    modelish = []
+    for tok in toks[1:]:
+        if re.search(r"[A-Za-z]+\d|\d+[A-Za-z]", tok) and 2 <= len(tok) <= 15:
+            modelish.append(tok.strip("()[]{}.,;:"))
+        elif tok.isupper() and 2 <= len(tok) <= 6:
+            modelish.append(tok.strip("()[]{}.,;:"))
+
+    modelish = list(dict.fromkeys([m for m in modelish if m]))
+    if modelish:
+        return " ".join([brand] + modelish[:3])
+
+    return " ".join(toks[:3])
+
+
+def is_bax_input_allowed(bax_item: dict) -> tuple[bool, str]:
+    title = clean(bax_item.get("title") or bax_item.get("name"))
+    url = clean(bax_item.get("source_url") or bax_item.get("url"))
+    breadcrumb = clean(bax_item.get("breadcrumb_category")) or ""
+
+    blob = " ".join([x for x in [title, url, breadcrumb] if x]).lower()
+
+    if _keyword_hit(blob, EXCLUDED_CATEGORY_KEYWORDS):
+        return False, "bax_excluded_keyword"
+
+    if "microfoon" not in blob and "microfoons" not in blob:
+        return False, "bax_not_microfoonish"
+
+    return True, "bax_ok"
+
+
 # -------------------------
 # spider
 # -------------------------
@@ -213,7 +401,6 @@ class BolProductsSpider(scrapy.Spider):
     name = "bol_products"
     allowed_domains = ["bol.com"]
 
-    # fallback seed (used when no bax titles are provided)
     start_urls = ["https://www.bol.com/nl/nl/l/microfoons/7119/"]
 
     custom_settings = {
@@ -231,19 +418,15 @@ class BolProductsSpider(scrapy.Spider):
         "CLOSESPIDER_PAGECOUNT": 200,
     }
 
-    crawler_version = "bol_products/RAW-2.1-brightdata-input"
+    crawler_version = "bol_products/RAW-2.4-brightdata-proxy-or-unlocker"
 
     def __init__(self, *args, bax_json_path=None, max_titles=50, debug_dump=1, **kwargs):
         super().__init__(*args, **kwargs)
         self.scrape_run_id = str(uuid.uuid4())
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.git_commit_hash = get_git_commit_hash()
-        self._seed_emitted = False
 
-        # Bright Data evidence + enforcement
         self.bd_mode = brightdata_mode()
-
-        # Optional input file from Bax teammate
         self.bax_json_path = bax_json_path
         try:
             self.max_titles = int(max_titles)
@@ -251,8 +434,6 @@ class BolProductsSpider(scrapy.Spider):
             self.max_titles = 50
 
         self.debug_dump = str(debug_dump).strip() not in {"0", "false", "False", "no", "NO"}
-
-    # -------- debug dump --------
 
     def _dump_response(self, response, label: str):
         if not self.debug_dump:
@@ -266,17 +447,11 @@ class BolProductsSpider(scrapy.Spider):
         except Exception as exc:
             self.logger.warning("Could not save debug HTML err=%s", exc)
 
-    # -------- input loader --------
-
-    def load_bax_titles(self):
-        """
-        Reads product titles from a JSON array OR JSON Lines file.
-        It expects each object to have: "title" (or "name" as fallback).
-        """
+    def load_bax_items(self) -> list[dict]:
         if not self.bax_json_path:
             return []
 
-        titles = []
+        items = []
         path = self.bax_json_path
 
         try:
@@ -284,18 +459,26 @@ class BolProductsSpider(scrapy.Spider):
                 first = f.read(1)
                 f.seek(0)
 
-                # JSON array
+                def add_obj(obj):
+                    if not isinstance(obj, dict):
+                        return
+                    title = clean(obj.get("title") or obj.get("name"))
+                    source_url = clean(obj.get("source_url") or obj.get("url"))
+                    if not title:
+                        return
+                    items.append({
+                        "title": title,
+                        "source_url": source_url,
+                        "seed_category": clean(obj.get("seed_category")),
+                        "breadcrumb_category": clean(obj.get("breadcrumb_category")),
+                    })
+
                 if first == "[":
                     data = json.load(f)
                     if isinstance(data, list):
                         for obj in data:
-                            if not isinstance(obj, dict):
-                                continue
-                            t = clean(obj.get("title") or obj.get("name"))
-                            if t:
-                                titles.append(t)
+                            add_obj(obj)
                 else:
-                    # JSON Lines
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -304,57 +487,78 @@ class BolProductsSpider(scrapy.Spider):
                             obj = json.loads(line)
                         except Exception:
                             continue
-                        if not isinstance(obj, dict):
-                            continue
-                        t = clean(obj.get("title") or obj.get("name"))
-                        if t:
-                            titles.append(t)
+                        add_obj(obj)
 
         except Exception as exc:
             self.logger.warning("Could not read bax_json_path=%s err=%s", path, exc)
             return []
 
-        # dedupe while preserving order
-        titles = list(dict.fromkeys(titles))
-        return titles[: self.max_titles]
+        seen = set()
+        deduped = []
+        for it in items:
+            key = (it.get("title"), it.get("source_url"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(it)
 
-    # -------- crawl entry --------
+        return deduped[: self.max_titles]
 
     def start_requests(self):
-        # Enforce Bright Data usage (assignment requirement)
+        # guardrails
         if self.bd_mode == "disabled":
             raise RuntimeError(
-                "Bright Data is required. Set BRIGHTDATA_* env vars "
-                "(either proxy creds or token+zone) before running bol_products."
+                "Bright Data is required. Set BRIGHTDATA_TOKEN+BRIGHTDATA_ZONE (Unlocker) "
+                "OR BRIGHTDATA_PROXY / (USERNAME+PASSWORD+HOST+PORT) (proxy mode)."
             )
 
-        # Emit run metadata once
+        # warn if both are set
+        if (os.getenv("BRIGHTDATA_TOKEN") and os.getenv("BRIGHTDATA_ZONE")) and (
+            os.getenv("BRIGHTDATA_PROXY")
+            or (os.getenv("BRIGHTDATA_USERNAME") and os.getenv("BRIGHTDATA_PASSWORD"))
+        ):
+            self.logger.warning("Both Unlocker API and proxy creds are set; using Unlocker API.")
+
         yield {
             "type": "run",
             "scrape_run_id": self.scrape_run_id,
             "started_at": self.started_at,
             "git_commit_hash": self.git_commit_hash,
             "crawler_version": self.crawler_version,
-            "notes": "bol crawl (category fallback OR bax-title search input)",
+            "notes": "bol crawl (category fallback OR bax-item search input)",
             "brightdata_mode": self.bd_mode,
             "bax_json_path": self.bax_json_path,
             "max_titles": self.max_titles,
         }
 
-        # If we have Bax titles, search Bol by title
-        titles = self.load_bax_titles()
-        if titles:
-            self.logger.info("Using %s Bax titles as Bol search input", len(titles))
-            for t in titles:
-                search_url = "https://www.bol.com/nl/nl/s/?" + urlencode({"searchtext": t})
-                yield scrapy.Request(search_url, callback=self.parse_search, meta={"query_title": t})
+        bax_items = self.load_bax_items()
+        if bax_items:
+            for bax in bax_items:
+                ok, _reason = is_bax_input_allowed(bax)
+                if not ok:
+                    continue
+
+                query = extract_query_from_bax_title(bax["title"]) or bax["title"]
+                search_url = "https://www.bol.com/nl/nl/s/?" + urlencode({"searchtext": query})
+
+                req = scrapy.Request(
+                    search_url,
+                    callback=self.parse_search,
+                    meta={
+                        "query_title": bax["title"],
+                        "query_text": query,
+                        "bax_source_url": bax.get("source_url"),
+                        "bax_seed_category": bax.get("seed_category"),
+                        "bax_breadcrumb_category": bax.get("breadcrumb_category"),
+                    },
+                )
+                yield apply_brightdata_meta(req)
             return
 
-        # Otherwise, fallback to your original category crawl
+        # fallback crawl
         for url in self.start_urls:
-            yield scrapy.Request(url, callback=self.parse)
-
-    # -------- search parsing (NEW) --------
+            req = scrapy.Request(url, callback=self.parse)
+            yield apply_brightdata_meta(req)
 
     def parse_search(self, response):
         title = clean(response.css("title::text").get())
@@ -364,7 +568,8 @@ class BolProductsSpider(scrapy.Spider):
             self._dump_response(response, "search_blocked")
             return
 
-        query_title = response.meta.get("query_title")
+        query_title = clean(response.meta.get("query_title"))
+        query_text = clean(response.meta.get("query_text"))
 
         links = response.css('a[data-test="product-title"]::attr(href)').getall()
         if not links:
@@ -374,17 +579,48 @@ class BolProductsSpider(scrapy.Spider):
 
         links = [strip_tracking(response.urljoin(h)) for h in links if h]
         links = list(dict.fromkeys(links))
-
         if not links:
-            # save HTML so you can inspect what Bol returned
             self._dump_response(response, "search_no_links")
             return
 
-        # Keep crawl bounded: take first few results per Bax title
-        for url in links[:5]:
-            yield response.follow(url, callback=self.parse_product, meta={"query_title": query_title})
+        q_tokens = _norm_tokens(query_title or query_text)
+        scored = []
+        for a in response.css('a[data-test="product-title"]'):
+            href = a.attrib.get("href")
+            if not href:
+                continue
+            url = strip_tracking(response.urljoin(href))
+            txt = clean(" ".join(a.css("*::text").getall())) or ""
+            t_tokens = _norm_tokens(txt)
+            overlap = len(q_tokens & t_tokens)
+            scored.append((overlap, url))
 
-    # -------- original category crawl --------
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top_urls, seen = [], set()
+            for _, u in scored:
+                if u in seen:
+                    continue
+                seen.add(u)
+                top_urls.append(u)
+                if len(top_urls) >= 3:
+                    break
+        else:
+            top_urls = links[:3]
+
+        for url in top_urls:
+            req = response.follow(
+                url,
+                callback=self.parse_product,
+                meta={
+                    "query_title": query_title,
+                    "query_text": query_text,
+                    "bax_source_url": response.meta.get("bax_source_url"),
+                    "bax_seed_category": response.meta.get("bax_seed_category"),
+                    "bax_breadcrumb_category": response.meta.get("bax_breadcrumb_category"),
+                },
+            )
+            yield apply_brightdata_meta(req)
 
     def parse(self, response):
         title = clean(response.css("title::text").get())
@@ -394,12 +630,6 @@ class BolProductsSpider(scrapy.Spider):
             self._dump_response(response, "listing_blocked")
             return
 
-        # Emit subcategories (only once, from the seed page)
-        if not self._seed_emitted and "microfoons/7119" in response.url:
-            self._seed_emitted = True
-            yield from self.parse_subcategories(response)
-
-        # Product links
         links = response.css('a[data-test="product-title"]::attr(href)').getall()
         if not links:
             links = response.css('li[data-test="product-item"] a[href*="/nl/nl/p/"]::attr(href)').getall()
@@ -414,9 +644,9 @@ class BolProductsSpider(scrapy.Spider):
             return
 
         for url in links:
-            yield response.follow(url, callback=self.parse_product)
+            req = response.follow(url, callback=self.parse_product)
+            yield apply_brightdata_meta(req)
 
-        # Pagination
         next_page = (
             response.css('a[rel="next"]::attr(href)').get()
             or response.css('a[data-test="pagination-next"]::attr(href)').get()
@@ -424,64 +654,8 @@ class BolProductsSpider(scrapy.Spider):
             or response.css('a[aria-label*="Next"]::attr(href)').get()
         )
         if next_page:
-            yield response.follow(next_page, callback=self.parse)
-            return
-
-        # Fallback ?page=
-        p = urlparse(response.url)
-        q = parse_qs(p.query)
-        if "page" in q:
-            try:
-                cur = int(q["page"][0])
-                q["page"] = [str(cur + 1)]
-                url2 = urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
-                yield response.follow(url2, callback=self.parse)
-            except Exception:
-                pass
-        else:
-            if response.url.rstrip("/").endswith("/7119"):
-                q["page"] = ["2"]
-                url2 = urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
-                yield response.follow(url2, callback=self.parse)
-
-    def parse_subcategories(self, response):
-        """
-        Scrape the "subcategory chips" on:
-        https://www.bol.com/nl/nl/l/microfoons/7119/
-        """
-        raw = response.css('a[href*="/nl/nl/l/"]::attr(href)').getall()
-        urls = []
-        for h in raw:
-            u = strip_tracking(response.urljoin(h))
-            if looks_like_category_url(u):
-                urls.append(u)
-
-        urls = list(dict.fromkeys(urls))
-        children = [u for u in urls if "microfoon" in u.lower()]
-        candidates = children or urls
-
-        emitted = set()
-        for u in candidates:
-            if u in emitted:
-                continue
-            emitted.add(u)
-
-            path = urlparse(u).path
-            frag = path.strip("/").split("/")[-2:]
-            needle = "/".join(frag) if frag else path
-
-            label = clean(response.css(f'a[href*="{needle}"]::text').get())
-            label = label or clean(response.css(f'a[href*="{needle}"] span::text').get())
-
-            yield {
-                "type": "subcategory",
-                "scrape_run_id": self.scrape_run_id,
-                "seed_url": strip_tracking(response.url),
-                "name": label,
-                "url": u,
-            }
-
-    # -------- product parsing (mostly unchanged) --------
+            req = response.follow(next_page, callback=self.parse)
+            yield apply_brightdata_meta(req)
 
     def parse_product(self, response):
         scraped_at = datetime.now(timezone.utc).isoformat()
@@ -493,13 +667,14 @@ class BolProductsSpider(scrapy.Spider):
             "scraped_at": scraped_at,
             "source_url": source_url,
 
-            # NEW: if this came from bax input search
             "query_title": clean(response.meta.get("query_title")),
+            "query_text": clean(response.meta.get("query_text")),
+            "bax_source_url": clean(response.meta.get("bax_source_url")),
+            "bax_seed_category": clean(response.meta.get("bax_seed_category")),
+            "bax_breadcrumb_category": clean(response.meta.get("bax_breadcrumb_category")),
 
-            # category fallback seed label (kept)
             "seed_category": "microfoons/7119",
 
-            # product identity
             "title": None,
             "brand": None,
             "model": None,
@@ -508,11 +683,9 @@ class BolProductsSpider(scrapy.Spider):
             "mpn": None,
             "sku": None,
 
-            # content
             "description": None,
             "image_url": None,
 
-            # price snapshot
             "currency": "EUR",
             "current_price": None,
             "base_price": None,
@@ -522,15 +695,16 @@ class BolProductsSpider(scrapy.Spider):
             "in_stock": None,
             "stock_status_text": None,
 
-            # review aggregate
             "rating_value": None,
             "rating_scale": 5,
             "review_count": None,
 
-            # breadcrumbs
             "breadcrumb_category": None,
             "breadcrumb_parent": None,
             "breadcrumb_url": None,
+
+            "kept": None,
+            "drop_reason": None,
         }
 
         # JSON-LD
@@ -570,6 +744,7 @@ class BolProductsSpider(scrapy.Spider):
                 if v:
                     item["gtin"] = clean(v)
                     break
+
             if product_ld.get("mpn"):
                 item["mpn"] = clean(product_ld.get("mpn"))
             if product_ld.get("sku"):
@@ -649,7 +824,7 @@ class BolProductsSpider(scrapy.Spider):
         if not item["description"]:
             item["description"] = meta_content(response, "description", "og:description")
 
-        # Price parsing from buybox
+        # Price parsing
         buy_block = response.css('[data-test="buy-block"], [data-test="buybox"], [data-test="buyBox"]')
         buy_text = clean(" ".join(buy_block.css("*::text").getall())) if buy_block else None
 
@@ -684,60 +859,7 @@ class BolProductsSpider(scrapy.Spider):
                 if item["discount_percent"] is None and item["base_price"] > 0:
                     item["discount_percent"] = round((item["discount_amount"] / item["base_price"]) * 100, 2)
 
-        # Availability
-        if not item["stock_status_text"] or item["in_stock"] is None:
-            if buy_text:
-                item["stock_status_text"] = item["stock_status_text"] or buy_text
-                if item["in_stock"] is None:
-                    low = buy_text.lower()
-                    if any(x in low for x in ["niet leverbaar", "uitverkocht", "tijdelijk niet beschikbaar"]):
-                        item["in_stock"] = False
-                    elif any(x in low for x in ["morgen in huis", "op voorraad", "voor 23:59", "leverbaar"]):
-                        item["in_stock"] = True
-
-        # Ratings fallback
-        if not item["rating_value"] or not item["review_count"]:
-            rating_text = clean(
-                " ".join(
-                    response.css(
-                        '[data-test*="rating"] *::text, a[href*="reviews"] *::text, [href*="#review"] *::text'
-                    ).getall()
-                )
-            ) or ""
-            if not item["rating_value"]:
-                m = re.search(r"\b(\d(?:[.,]\d)?)\b", rating_text)
-                if m:
-                    item["rating_value"] = m.group(1).replace(",", ".")
-            if not item["review_count"]:
-                m = re.search(r"\b(\d+)\b", rating_text)
-                if m:
-                    item["review_count"] = m.group(1)
-
-        # Breadcrumb HTML fallback
-        if not item["breadcrumb_url"] or not looks_like_category_url(item["breadcrumb_url"]):
-            crumb_texts = response.css(
-                'nav a[href]::text, ol a[href]::text, a[data-test*="breadcrumb"]::text'
-            ).getall()
-            crumb_hrefs = response.css(
-                'nav a[href]::attr(href), ol a[href]::attr(href), a[data-test*="breadcrumb"]::attr(href)'
-            ).getall()
-
-            crumb_texts = [clean(c) for c in crumb_texts if clean(c)]
-            crumb_hrefs = [strip_tracking(response.urljoin(h)) for h in crumb_hrefs if h]
-
-            pairs = []
-            for i in range(min(len(crumb_texts), len(crumb_hrefs))):
-                nm = crumb_texts[i]
-                u = crumb_hrefs[i]
-                if nm and u and looks_like_category_url(u):
-                    pairs.append((nm, u))
-
-            if pairs:
-                item["breadcrumb_category"], item["breadcrumb_url"] = pairs[-1]
-                if len(pairs) >= 2:
-                    item["breadcrumb_parent"] = pairs[-2][0]
-
-        # Identifier fallbacks
+        # Identifier fallbacks (EAN/GTIN regex)
         if not item["gtin"] or not item["mpn"] or not item["model"]:
             body_text = clean(" ".join(response.css("body *::text").getall())) or ""
 
@@ -769,5 +891,11 @@ class BolProductsSpider(scrapy.Spider):
             canonicalize(item["brand"], item["title"], item["model"])
             or canonicalize(None, item["title"], None)
         )
+
+        keep, reason = should_keep_item(item)
+        item["kept"] = keep
+        item["drop_reason"] = None if keep else reason
+        if not keep:
+            return
 
         yield item
