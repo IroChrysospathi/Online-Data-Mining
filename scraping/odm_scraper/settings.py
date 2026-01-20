@@ -6,7 +6,14 @@ Global Scrapy settings.
 - Stable configuration for Bol.com
 """
 
+from pathlib import Path
+
+
 BOT_NAME = "odm_scraper"
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
+RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 SPIDER_MODULES = ["odm_scraper.spiders"]
 NEWSPIDER_MODULE = "odm_scraper.spiders"
@@ -70,4 +77,11 @@ DOWNLOADER_MIDDLEWARES = {
 
 ITEM_PIPELINES = {
     "odm_scraper.pipelines.InitDbPipeline": 100,
+}
+
+FEEDS = {
+    str(RAW_DATA_DIR / "%(name)s.json"): {
+        "format": "jsonlines",
+        "encoding": "utf-8",
+    }
 }
