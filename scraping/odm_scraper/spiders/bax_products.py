@@ -17,6 +17,27 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 import scrapy
 
 
+# Category keyword allowlist based on the provided Bax microphones scope.
+ALLOWED_CATEGORY_KEYWORDS = {
+    "microfoon",
+    "microfoons",
+    "studiomicrofoon",
+    "live-microfoon",
+    "draadloze-microfoon",
+    "usb-microfoon",
+    "multimedia-av-microfoon",
+    "microfoonstatieven",
+    "microfoon-statief",
+    "zang-microfoon",
+    "microfoon-opnameset",
+    "microfoon-accessoire",
+    "microfoon-onderdeel",
+    "microfoon-voorversterker",
+    "vocal-effect",
+    "vocal-effecten",
+}
+
+
 # helpers
 def clean(text):
     if text is None:
@@ -127,7 +148,16 @@ def should_follow_url(url: str) -> bool:
         return False
     if any(x in u for x in ["/notify-product-in-stock/", "/wishlist", "/checkout", "/basket", "/login", "/account"]):
         return False
+    if re.search(r"\.(pdf|zip|jpe?g|png|svg)$", urlparse(u).path):
+        return False
     return True
+
+
+def is_allowed_category_url(url: str) -> bool:
+    if not url:
+        return False
+    path = urlparse(url).path.lower()
+    return any(k in path for k in ALLOWED_CATEGORY_KEYWORDS)
 
 
 def get_git_commit_hash() -> str | None:
@@ -242,6 +272,10 @@ class BaxProductsSpider(scrapy.Spider):
         self.scrape_run_id = str(uuid.uuid4())
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.git_commit_hash = get_git_commit_hash()
+        try:
+            self.max_category_depth = int(kwargs.get("max_depth", 3))
+        except ValueError:
+            self.max_category_depth = 3
 
     def start_requests(self):
         # Emit run metadata once
@@ -255,10 +289,11 @@ class BaxProductsSpider(scrapy.Spider):
         }
 
         for url in self.start_urls:
-            yield scrapy.Request(url, callback=self.parse)
+            yield scrapy.Request(url, callback=self.parse, meta={"category_depth": 0})
 
     def parse(self, response):
         self.logger.info("LISTING status=%s url=%s", response.status, response.url)
+        category_depth = response.meta.get("category_depth", 0)
 
         # JSON-LD ItemList links (most reliable for product grids)
         blocks = response.css('script[type="application/ld+json"]::text').getall()
@@ -273,12 +308,13 @@ class BaxProductsSpider(scrapy.Spider):
             except Exception:
                 continue
 
-        product_ld = None
+        product_nodes = []
         for n in nodes:
             t = n.get("@type")
             if t == "Product" or (isinstance(t, list) and "Product" in t):
-                product_ld = n
-                break
+                product_nodes.append(n)
+
+        product_ld = product_nodes[0] if product_nodes else None
 
         itemlist_product_urls = extract_itemlist_urls(nodes, only_product=True)
         product_tile_nodes = response.css(
@@ -291,18 +327,26 @@ class BaxProductsSpider(scrapy.Spider):
         )
 
         og_type = (meta_content(response, "og:type") or "").lower()
+        has_price_meta = bool(response.css('[itemprop="price"], meta[property="product:price:amount"]').get())
+        has_buybox = bool(response.css('form[action*="cart"], [data-test*="add-to-cart"]').get())
+
         is_product_page = False
-        if "product" in og_type:
+        if len(product_nodes) == 1:
+            is_product_page = True
+        elif "product" in og_type and not has_pagination:
             is_product_page = True
         elif product_ld and (
-            response.css('[itemprop="price"], meta[property="product:price:amount"]').get()
-            or response.css('form[action*="cart"], [data-test*="add-to-cart"]').get()
+            has_price_meta
+            or has_buybox
             or (isinstance(product_ld.get("offers"), dict) and product_ld["offers"].get("price"))
         ):
             is_product_page = True
 
         is_listing = not is_product_page and (
-            len(itemlist_product_urls) >= 5 or len(product_tile_nodes) >= 6 or has_pagination
+            len(itemlist_product_urls) >= 5
+            or len(product_tile_nodes) >= 6
+            or has_pagination
+            or len(product_nodes) > 1
         )
 
         if is_product_page:
@@ -311,8 +355,7 @@ class BaxProductsSpider(scrapy.Spider):
 
         links = itemlist_product_urls
         listing_links = []
-        if not links:
-            listing_links = extract_itemlist_urls(nodes, only_product=False)
+        listing_links = extract_itemlist_urls(nodes, only_product=False)
 
         # HTML fallback selectors
         if not links:
@@ -329,9 +372,9 @@ class BaxProductsSpider(scrapy.Spider):
         links = list(dict.fromkeys(links))
 
         for url in links:
-            yield response.follow(url, callback=self.parse)
+            yield response.follow(url, callback=self.parse_product)
 
-        if not links:
+        if category_depth < self.max_category_depth:
             if not listing_links:
                 listing_links = response.css(
                     'a[href*="/microfoon"]::attr(href), '
@@ -340,11 +383,19 @@ class BaxProductsSpider(scrapy.Spider):
                 ).getall()
 
             listing_links = [strip_tracking(response.urljoin(h)) for h in listing_links if h]
-            listing_links = [u for u in listing_links if should_follow_url(u) and u != response.url]
+            listing_links = [
+                u
+                for u in listing_links
+                if should_follow_url(u) and is_allowed_category_url(u) and u != response.url
+            ]
             listing_links = list(dict.fromkeys(listing_links))
 
             for url in listing_links:
-                yield response.follow(url, callback=self.parse)
+                yield response.follow(
+                    url,
+                    callback=self.parse,
+                    meta={"category_depth": category_depth + 1},
+                )
 
         # Pagination
         next_page = (
