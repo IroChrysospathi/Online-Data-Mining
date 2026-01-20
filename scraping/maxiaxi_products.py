@@ -1,46 +1,40 @@
-# 0. Environment Setup
+# =========================
+# MaxiAxi Microfoons Scraper (DB schema aligned)
+# Writes to existing repo SQLite DB (db/odm.sqlite) + JSONL output
+# Blocked-page detection + debug HTML dump
+# NO CSV output
+# =========================
 
-
-# Core
-import re
 import json
-import time
-import math
-import hashlib
-from dataclasses import dataclass, asdict
+import os
+import re
+import sqlite3
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from pathlib import Path
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 import pandas as pd
-import numpy as np
-
-# Database
-import sqlite3
-
-# Scrapy
 import scrapy
 from scrapy.crawler import CrawlerProcess
-from scrapy.utils.project import get_project_settings
 
-print("Setup OK. Timestamp:", datetime.now().isoformat())
 
-# 1. Global Configuration (MaxiAxi - Microfoons only)
+# =========================
+# 1) CONFIG
+# =========================
 
-from datetime import datetime
-
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 CONFIG = {
     "run_id": RUN_ID,
     "currency": "EUR",
-    "max_pages_per_category": 20,       # adjust if needed
+    "max_pages_per_category": 20,
     "download_delay_s": 1.25,
     "concurrent_requests": 4,
     "user_agent": "AUAS-ODM-Scraper/1.0 (educational use)",
     "timeout_s": 25,
+    "debug_dump": str(os.getenv("DEBUG_DUMP", "1")).strip() not in {"0", "false", "False", "no", "NO"},
 }
 
-# Task seed (use the exact URL you provided)
 MAXIAXI_MICROFOONS_URL = (
     "https://www.maxiaxi.com/microfoons/"
     "?_gl=1*wun1p3*_up*MQ..*_gs*MQ.."
@@ -48,238 +42,165 @@ MAXIAXI_MICROFOONS_URL = (
     "&gbraid=0AAAAADo6YHPbIVtlWk2zNZUOX0tH2Wu3R"
 )
 
-# Only MaxiAxi
 RETAILERS = {
     "maxiaxi": {
         "name": "MaxiAxi",
+        "country": "NL",
         "base_url": "https://www.maxiaxi.com/",
         "is_marketplace": False,
-        "policy_urls": {
-            "shipping_returns": "https://www.maxiaxi.com/klantenservice/",
-        },
-        "expert_support_urls": {
-            "advice": "https://www.maxiaxi.com/advies/",
-        },
-        "category_seeds": {
-            "microphones": MAXIAXI_MICROFOONS_URL,
-        }
+        "policy_urls": {"shipping_returns": "https://www.maxiaxi.com/klantenservice/"},
+        "expert_support_urls": {"advice": "https://www.maxiaxi.com/advies/"},
+        "category_seeds": {"microphones": MAXIAXI_MICROFOONS_URL},
     }
 }
 
-# Only the selected task category
-CATEGORIES = [
-    {"category_id": 1, "category_name": "Microphones", "key": "microphones"},
-]
 
-print("Config loaded. Retailers:", list(RETAILERS.keys()), "Run:", RUN_ID)
-print("Seed:", MAXIAXI_MICROFOONS_URL)
+# =========================
+# 2) OUTPUT PATHS (JSON + DEBUG)
+# =========================
 
-import sqlite3
-from pathlib import Path
-from datetime import datetime, timezone
-
-# 1. Run identifier
-
-try:
-    RUN_ID
-except NameError:
-    RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
-# 2. Desktop path
-
-DESKTOP_DIR = Path("/Users/feddekoster/Desktop")
-
-if not DESKTOP_DIR.exists():
-    raise OSError(
-        f"Desktop directory not found at {DESKTOP_DIR}. "
-        "Check that the username is correct or that Desktop exists."
-    )
-
-# Test write permissions explicitly
-try:
-    test_file = DESKTOP_DIR / ".odm_write_test"
-    test_file.write_text("ok", encoding="utf-8")
-    test_file.unlink()
-except Exception as e:
-    raise PermissionError(
-        "Desktop is not writable by this Python/Jupyter process.\n\n"
-        "macOS fix:\n"
-        "System Settings → Privacy & Security → Files and Folders (or Full Disk Access)\n"
-        "→ Enable Desktop access for the app running Jupyter (Terminal / VS Code / Anaconda).\n\n"
-        f"Original error: {e}"
-    )
-
-# 3. Assignment output folder
-
-OUT_DIR = DESKTOP_DIR / "ODM_Assignment2"
+DEFAULT_OUT_DIR = "~/Desktop/Assignment/Onlune-Data-Mining/data/raw/maxiaxi"
+OUT_DIR = Path(os.getenv("OUTPUT_DIR", DEFAULT_OUT_DIR)).expanduser()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = OUT_DIR / f"odm_competitor_benchmark_{RUN_ID}.sqlite"
+DEBUG_DIR = OUT_DIR / "debug"
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+JSONL_PATH = OUT_DIR / f"maxiaxi_items_{RUN_ID}.jsonl"
+DB_EXPORT_JSON_PATH = OUT_DIR / f"odm_db_export_{RUN_ID}.json"
 
 
-# 4. Database schema
+# =========================
+# 3) DATABASE (CONNECT TO EXISTING REPO DB)
+# =========================
 
-DDL = """
-PRAGMA foreign_keys = ON;
+def get_repo_root() -> Path:
+    gh = os.getenv("GITHUB_WORKSPACE")
+    if gh:
+        return Path(gh).resolve()
 
-CREATE TABLE IF NOT EXISTS retailer (
-  retailer_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  retailer_key TEXT UNIQUE NOT NULL,
-  name TEXT NOT NULL,
-  base_url TEXT NOT NULL,
-  is_marketplace INTEGER NOT NULL,
-  created_at TEXT NOT NULL
-);
+    p = Path(__file__).resolve()
+    if p.parent.name.lower() == "scraping":
+        return p.parent.parent
+    return p.parent
 
-CREATE TABLE IF NOT EXISTS category (
-  category_id INTEGER PRIMARY KEY,
-  category_key TEXT UNIQUE NOT NULL,
-  category_name TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS product_page (
-  product_page_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  retailer_id INTEGER NOT NULL,
-  category_id INTEGER NOT NULL,
-  url TEXT NOT NULL,
-  retailer_product_id TEXT,
-  page_title TEXT,
-  brand TEXT,
-  gtin_ean TEXT,
-  last_seen_at TEXT NOT NULL,
-  UNIQUE(retailer_id, url),
-  FOREIGN KEY(retailer_id) REFERENCES retailer(retailer_id),
-  FOREIGN KEY(category_id) REFERENCES category(category_id)
-);
+def get_db_path() -> Path:
+    env = os.getenv("DB_PATH")
+    if env:
+        return Path(env).expanduser().resolve()
+    return (get_repo_root() / "db" / "odm.sqlite").resolve()
 
-CREATE TABLE IF NOT EXISTS offer_observation (
-  observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  product_page_id INTEGER NOT NULL,
-  observed_at TEXT NOT NULL,
-  price_current REAL,
-  price_reference REAL,
-  discount_pct REAL,
-  promo_flag INTEGER,
-  stock_text_raw TEXT,
-  delivery_promise_text TEXT,
-  currency TEXT NOT NULL,
-  http_status INTEGER,
-  scrape_run_id TEXT NOT NULL,
-  FOREIGN KEY(product_page_id) REFERENCES product_page(product_page_id)
-);
 
-CREATE TABLE IF NOT EXISTS retailer_page_capture (
-  capture_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  retailer_id INTEGER NOT NULL,
-  page_type TEXT NOT NULL,
-  source_url TEXT NOT NULL,
-  captured_at TEXT NOT NULL,
-  content_text TEXT,
-  http_status INTEGER,
-  scrape_run_id TEXT NOT NULL,
-  FOREIGN KEY(retailer_id) REFERENCES retailer(retailer_id)
-);
-"""
+DB_PATH = get_db_path()
 
-# 5. Create database
 
-def db_connect(path: Path):
+def db_connect(path: Path) -> sqlite3.Connection:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"SQLite DB not found: {path}\n"
+            "Expected: <repo>/db/odm.sqlite or set DB_PATH env var."
+        )
     con = sqlite3.connect(str(path))
+    con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON;")
     return con
 
-with db_connect(DB_PATH) as con:
-    con.executescript(DDL)
 
-from datetime import datetime, timezone
+def table_exists(con: sqlite3.Connection, table: str) -> bool:
+    row = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row is not None
 
-# 2b. Seed reference tables
 
-def upsert_retailers(con):
-    now = datetime.now(timezone.utc).isoformat()
-    for r_key, r in RETAILERS.items():
-        con.execute("""
-            INSERT INTO retailer (retailer_key, name, base_url, is_marketplace, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(retailer_key) DO UPDATE SET
-                name=excluded.name,
-                base_url=excluded.base_url,
-                is_marketplace=excluded.is_marketplace
-        """, (r_key, r["name"], r["base_url"], int(r["is_marketplace"]), now))
+def get_table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    cols = set()
+    try:
+        for r in con.execute(f"PRAGMA table_info({table})").fetchall():
+            cols.add(r["name"])
+    except sqlite3.Error:
+        pass
+    return cols
+
+
+def ensure_competitor(con: sqlite3.Connection, retailer_key: str) -> int:
+    r = RETAILERS[retailer_key]
+    name = r["name"]
+    country = r.get("country")
+    base_url = r.get("base_url")
+
+    row = con.execute("SELECT competitor_id FROM competitor WHERE name = ?", (name,)).fetchone()
+    if row:
+        cid = int(row["competitor_id"])
+        con.execute(
+            "UPDATE competitor SET country = COALESCE(?, country), base_url = COALESCE(?, base_url) WHERE competitor_id = ?",
+            (country, base_url, cid),
+        )
+        con.commit()
+        return cid
+
+    con.execute(
+        "INSERT INTO competitor (name, country, base_url) VALUES (?, ?, ?)",
+        (name, country, base_url),
+    )
     con.commit()
+    return int(con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
 
-def seed_categories(con):
-    for c in CATEGORIES:
-        con.execute("""
-            INSERT OR REPLACE INTO category (category_id, category_key, category_name)
-            VALUES (?, ?, ?)
-        """, (c["category_id"], c["key"], c["category_name"]))
+
+def ensure_category_row(
+    con: sqlite3.Connection,
+    competitor_id: int,
+    name: str,
+    url: str | None,
+    parent_category_id: int | None = None,
+) -> int:
+    """
+    category schema:
+      category_id PK
+      competitor_id NOT NULL
+      name
+      url
+      parent_category_id
+    """
+    if not name:
+        raise ValueError("Category.name is required.")
+
+    row = con.execute(
+        "SELECT category_id FROM category WHERE competitor_id = ? AND name = ?",
+        (competitor_id, name),
+    ).fetchone()
+
+    if row:
+        cat_id = int(row["category_id"])
+        con.execute(
+            "UPDATE category SET url = COALESCE(?, url), parent_category_id = COALESCE(?, parent_category_id) WHERE category_id = ?",
+            (url, parent_category_id, cat_id),
+        )
+        con.commit()
+        return cat_id
+
+    con.execute(
+        "INSERT INTO category (competitor_id, name, url, parent_category_id) VALUES (?, ?, ?, ?)",
+        (competitor_id, name, url, parent_category_id),
+    )
     con.commit()
+    return int(con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
 
-with db_connect() as con:  
-    upsert_retailers(con)
-    seed_categories(con)
 
-from pathlib import Path
-
-OUTPUT_DIR = OUT_DIR  
-PROD_CSV_PATH = OUTPUT_DIR / f"product_observations_{RUN_ID}.csv"
-RET_CSV_PATH  = OUTPUT_DIR / f"retailer_pages_{RUN_ID}.csv"
-
-# 3. Helper functions (Scraper 2.0 - MaxiAxi Microfoons)
-
-import re
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+# =========================
+# 4) HELPERS
+# =========================
 
 def clean_text(x):
     if x is None:
         return None
-    x = str(x)
-    x = re.sub(r"\s+", " ", x).strip()
-    return x if x else None
+    s = re.sub(r"\s+", " ", str(x)).strip()
+    return s or None
 
-def parse_price(price_text):
-    """
-    Parse price strings like:
-    '€ 39,95' -> 39.95
-    '39,95'   -> 39.95
-    """
-    if not price_text:
-        return None
-    t = clean_text(price_text)
-    if not t:
-        return None
-
-    # Keep digits, comma, dot
-    t = re.sub(r"[^\d,\.]", "", t)
-
-    # If comma is used as decimal separator
-    # Example: 39,95 -> 39.95
-    if t.count(",") == 1 and t.count(".") == 0:
-        t = t.replace(",", ".")
-    # If both appear, assume dot is thousands and comma is decimal: 1.299,95 -> 1299.95
-    elif t.count(",") == 1 and t.count(".") >= 1:
-        t = t.replace(".", "").replace(",", ".")
-
-    try:
-        return float(t)
-    except:
-        return None
-
-def calc_discount_pct(price_reference, price_current):
-    if price_reference is None or price_current is None:
-        return None
-    if price_reference <= 0:
-        return None
-    if price_current >= price_reference:
-        return 0.0
-    return round((price_reference - price_current) / price_reference * 100.0, 2)
 
 def strip_tracking(url: str) -> str:
-    """
-    Benchmark-inspired URL normaliser (based on your classmate’s bol_products.py).
-    Removes common marketing/tracking parameters so URLs are stable across runs.
-    """
     if not url:
         return url
     try:
@@ -290,7 +211,7 @@ def strip_tracking(url: str) -> str:
             "gclid", "gbraid", "wbraid", "fbclid",
             "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
             "_gl", "_ga", "_gid", "mc_cid", "mc_eid",
-            "ref", "cid", "source"
+            "ref", "cid", "source",
         }
 
         for k in list(q.keys()):
@@ -302,44 +223,296 @@ def strip_tracking(url: str) -> str:
     except Exception:
         return url
 
-# 4. Scrapy Items
 
-class ProductObservationItem(scrapy.Item):
-    retailer_key = scrapy.Field()
-    category_key = scrapy.Field()
-    product_url = scrapy.Field()
-    page_title = scrapy.Field()
-    retailer_product_id = scrapy.Field()
+def looks_blocked_title(title: str | None) -> bool:
+    if not title:
+        return False
+    t = title.lower()
+    needles = [
+        "toestemming", "consent", "cookie",
+        "verify", "verific", "access denied", "blocked",
+        "captcha", "robot", "attention required",
+    ]
+    return any(n in t for n in needles)
+
+
+def is_blocked_response(response: scrapy.http.Response) -> bool:
+    title = clean_text(response.css("title::text").get())
+    if response.status in (403, 429, 503):
+        return True
+    if looks_blocked_title(title):
+        return True
+    return False
+
+
+# =========================
+# 5) SCRAPY ITEMS
+# =========================
+
+class CategoryItem(scrapy.Item):
+    competitor_key = scrapy.Field()
+    name = scrapy.Field()
+    url = scrapy.Field()
+    parent_category_id = scrapy.Field()
+
+
+class ProductListingItem(scrapy.Item):
+    competitor_key = scrapy.Field()
+    category_name = scrapy.Field()
+
+    product_url = scrapy.Field()             # maps to productlisting.product_url
+    product_name = scrapy.Field()            # maps to productlisting.product_name
+    ean = scrapy.Field()                     # maps to productlisting.ean
+    sku = scrapy.Field()                     # maps to productlisting.sku
+    image_url_on_pdp = scrapy.Field()        # maps to productlisting.image_url_on_pdp
+
+    # extras for JSONL only
+    description_clean = scrapy.Field()
     brand = scrapy.Field()
-    gtin_ean = scrapy.Field()
+    model = scrapy.Field()
 
-    price_current = scrapy.Field()
-    price_reference = scrapy.Field()
-    discount_pct = scrapy.Field()
-    promo_flag = scrapy.Field()
 
-    stock_text_raw = scrapy.Field()
-    delivery_promise_text = scrapy.Field()
+class PageRawItem(scrapy.Item):
+    competitor_key = scrapy.Field()
+    url = scrapy.Field()
 
-    observed_at = scrapy.Field()
-    http_status = scrapy.Field()
-    scrape_run_id = scrapy.Field()
 
-class RetailerPageItem(scrapy.Item):
-    retailer_key = scrapy.Field()
-    page_type = scrapy.Field()     # 'policy' or 'expert_support'
-    source_url = scrapy.Field()
-    captured_at = scrapy.Field()
-    content_text = scrapy.Field()
-    http_status = scrapy.Field()
-    scrape_run_id = scrapy.Field()
+# =========================
+# 6) PIPELINES (DB + JSONL OUTPUT)
+# =========================
 
-# 5. Spider (Scraper 2.0 - MaxiAxi Microfoons)
+class SQLitePipeline:
+    """
+    DB schema alignment (your schema):
 
-import scrapy
-from urllib.parse import urljoin
-from datetime import datetime, timezone
-import re
+    productlisting(listing_id PK, competitor_id, category_id, product_url, product_name, ean, sku, image_url_on_pdp)
+    product(product_id PK, listing_id FK, canonical_name, model)
+    pageraw(page_id PK, competitor_id, url)
+    """
+
+    def open_spider(self, spider):
+        self.con = db_connect(DB_PATH)
+        self.cur = self.con.cursor()
+
+        self.competitor_key = "maxiaxi"
+        self.competitor_id = ensure_competitor(self.con, self.competitor_key)
+
+        # Table presence
+        self.has_pageraw = table_exists(self.con, "pageraw")
+        self.has_product = table_exists(self.con, "product")
+        self.has_productlisting = table_exists(self.con, "productlisting")
+
+        # Column caches
+        self.productlisting_cols = get_table_columns(self.con, "productlisting") if self.has_productlisting else set()
+        self.product_cols = get_table_columns(self.con, "product") if self.has_product else set()
+
+        spider.logger.info("DB detected: pageraw=%s product=%s productlisting=%s",
+                           self.has_pageraw, self.has_product, self.has_productlisting)
+        spider.logger.info("DB columns: productlisting=%s", sorted(list(self.productlisting_cols)))
+        spider.logger.info("DB columns: product=%s", sorted(list(self.product_cols)))
+
+        seed_url = RETAILERS[self.competitor_key]["category_seeds"]["microphones"]
+        self.default_category_id = ensure_category_row(
+            self.con,
+            competitor_id=self.competitor_id,
+            name="Microphones",
+            url=strip_tracking(seed_url),
+            parent_category_id=None,
+        )
+
+    def close_spider(self, spider):
+        con = getattr(self, "con", None)
+        if con is not None:
+            try:
+                con.commit()
+            finally:
+                con.close()
+
+    def _insert_pageraw(self, url: str) -> None:
+        if not self.has_pageraw or not url:
+            return
+        try:
+            self.cur.execute(
+                "INSERT INTO pageraw (competitor_id, url) VALUES (?, ?)",
+                (self.competitor_id, url),
+            )
+        except sqlite3.IntegrityError:
+            pass
+
+    def _upsert_productlisting(self, category_id: int, d: dict) -> int:
+        """
+        Upsert into productlisting using ONLY your schema columns.
+        """
+        if not self.has_productlisting:
+            raise sqlite3.OperationalError("DB missing required table: productlisting")
+
+        product_url = d.get("product_url")
+        if not product_url:
+            raise ValueError("product_url is required for productlisting.")
+
+        # Map scraped fields -> DB columns
+        candidate = {
+            "competitor_id": self.competitor_id,
+            "category_id": category_id,
+            "product_url": product_url,
+            "product_name": d.get("product_name"),
+            "ean": d.get("ean"),
+            "sku": d.get("sku"),
+            "image_url_on_pdp": d.get("image_url_on_pdp"),
+        }
+
+        data = {k: v for k, v in candidate.items() if k in self.productlisting_cols}
+
+        row = self.cur.execute(
+            "SELECT listing_id FROM productlisting WHERE competitor_id = ? AND product_url = ?",
+            (self.competitor_id, product_url),
+        ).fetchone()
+
+        if row:
+            listing_id = int(row["listing_id"])
+            up_fields = {k: v for k, v in data.items() if k not in {"competitor_id", "product_url"} and v is not None}
+            if up_fields:
+                sets = ", ".join([f"{k} = COALESCE(?, {k})" for k in up_fields.keys()])
+                sql = f"UPDATE productlisting SET {sets} WHERE listing_id = ?"
+                self.cur.execute(sql, (*up_fields.values(), listing_id))
+            return listing_id
+
+        cols = list(data.keys())
+        vals = [data[c] for c in cols]
+        placeholders = ", ".join(["?"] * len(cols))
+        sql = f"INSERT INTO productlisting ({', '.join(cols)}) VALUES ({placeholders})"
+        self.cur.execute(sql, vals)
+        return int(self.cur.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+    def _upsert_product_row(self, listing_id: int, canonical_name: str | None, model: str | None) -> None:
+        """
+        product schema:
+          product_id PK
+          listing_id FK NOT NULL
+          canonical_name
+          model
+        In your DB, product is per listing, so we update/insert by listing_id.
+        """
+        if not self.has_product:
+            return
+
+        row = self.cur.execute(
+            "SELECT product_id FROM product WHERE listing_id = ?",
+            (listing_id,),
+        ).fetchone()
+
+        if row:
+            pid = int(row["product_id"])
+            self.cur.execute(
+                """
+                UPDATE product
+                SET canonical_name = COALESCE(?, canonical_name),
+                    model = COALESCE(?, model)
+                WHERE product_id = ?
+                """,
+                (canonical_name, model, pid),
+            )
+            return
+
+        self.cur.execute(
+            "INSERT INTO product (listing_id, canonical_name, model) VALUES (?, ?, ?)",
+            (listing_id, canonical_name, model),
+        )
+
+    def process_item(self, item, spider):
+        d = dict(item)
+
+        if isinstance(item, CategoryItem):
+            ensure_category_row(
+                self.con,
+                competitor_id=self.competitor_id,
+                name=d.get("name"),
+                url=d.get("url"),
+                parent_category_id=d.get("parent_category_id"),
+            )
+            self.con.commit()
+            return item
+
+        if isinstance(item, PageRawItem):
+            if self.has_pageraw:
+                self._insert_pageraw(d.get("url"))
+                self.con.commit()
+            return item
+
+        if isinstance(item, ProductListingItem):
+            category_id = self.default_category_id
+            listing_id = self._upsert_productlisting(category_id, d)
+
+            # Build canonical name for product table row
+            brand = clean_text(d.get("brand"))
+            model = clean_text(d.get("model"))
+            product_name = clean_text(d.get("product_name"))
+
+            canonical_name = None
+            if brand and model:
+                canonical_name = f"{brand} {model}"
+            else:
+                canonical_name = product_name
+
+            # Upsert product row linked to listing_id
+            self._upsert_product_row(listing_id, canonical_name=canonical_name, model=model)
+
+            self.con.commit()
+            return item
+
+        return item
+
+
+class JSONLPipeline:
+    def open_spider(self, spider):
+        self.f = JSONL_PATH.open("w", encoding="utf-8")
+
+        run_record = {
+            "type": "run",
+            "run_id": RUN_ID,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "spider": spider.name,
+            "seed": MAXIAXI_MICROFOONS_URL,
+            "repo_root": str(get_repo_root()),
+            "db_path": str(DB_PATH),
+            "db_exists": DB_PATH.exists(),
+            "output_dir": str(OUT_DIR),
+            "debug_dump": CONFIG["debug_dump"],
+            "config": {
+                "max_pages_per_category": CONFIG["max_pages_per_category"],
+                "download_delay_s": CONFIG["download_delay_s"],
+                "concurrent_requests": CONFIG["concurrent_requests"],
+                "timeout_s": CONFIG["timeout_s"],
+                "user_agent": CONFIG["user_agent"],
+            },
+        }
+        self.f.write(json.dumps(run_record, ensure_ascii=False) + "\n")
+
+    def close_spider(self, spider):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+        print("JSONL saved to:", JSONL_PATH)
+
+    def process_item(self, item, spider):
+        now = datetime.now(timezone.utc).isoformat()
+        t = "item"
+        if isinstance(item, ProductListingItem):
+            t = "productlisting"
+        elif isinstance(item, CategoryItem):
+            t = "category"
+        elif isinstance(item, PageRawItem):
+            t = "pageraw"
+
+        rec = {"type": t, "scraped_at": now, **dict(item)}
+        self.f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return item
+
+
+# =========================
+# 7) SPIDER (BLOCKED DETECTION + DEBUG DUMP)
+# =========================
 
 class CompetitorBenchmarkSpider(scrapy.Spider):
     name = "maxiaxi_microfoons"
@@ -353,62 +526,68 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         "DOWNLOAD_TIMEOUT": CONFIG["timeout_s"],
         "ROBOTSTXT_OBEY": True,
         "ITEM_PIPELINES": {
-            "__main__.SQLitePipeline": 300,
-            "__main__.CSVPipeline": 400,
-        }
+            "__main__.JSONLPipeline": 400,
+        },
     }
+
+    def _dump_response(self, response, label: str):
+        if not CONFIG["debug_dump"]:
+            return
+        try:
+            fn = DEBUG_DIR / f"{self.name}_{label}_{response.status}.html"
+            fn.write_bytes(response.body or b"")
+            self.logger.warning("Saved debug HTML to %s", fn.resolve())
+        except Exception as exc:
+            self.logger.warning("Could not save debug HTML err=%s", exc)
 
     def start_requests(self):
         r_key = "maxiaxi"
         r = RETAILERS[r_key]
 
-        # Retailer-level pages (optional but useful for ERD completeness)
-        for page_type, url in (r.get("policy_urls") or {}).items():
+        # Store raw policy/support pages in pageraw (since no pagelink table exists)
+        for _, url in (r.get("policy_urls") or {}).items():
             yield scrapy.Request(
                 url=strip_tracking(url),
-                callback=self.parse_retailer_page,
-                meta={"retailer_key": r_key, "page_type": page_type}
+                callback=self.parse_raw_page,
+                meta={"retailer_key": r_key},
             )
 
-        for page_type, url in (r.get("expert_support_urls") or {}).items():
+        for _, url in (r.get("expert_support_urls") or {}).items():
             yield scrapy.Request(
                 url=strip_tracking(url),
-                callback=self.parse_retailer_page,
-                meta={"retailer_key": r_key, "page_type": page_type}
+                callback=self.parse_raw_page,
+                meta={"retailer_key": r_key},
             )
 
-        # Category seed: microphones only
         seed = r["category_seeds"]["microphones"]
         yield scrapy.Request(
             url=strip_tracking(seed),
             callback=self.parse_listing,
-            meta={"retailer_key": r_key, "category_key": "microphones", "page_no": 1}
+            meta={"retailer_key": r_key, "category_key": "microphones", "page_no": 1},
         )
 
-    def parse_retailer_page(self, response):
-        retailer_key = response.meta["retailer_key"]
-        page_type = response.meta["page_type"]
+    def parse_raw_page(self, response):
+        title = clean_text(response.css("title::text").get())
+        self.logger.info("RAW_PAGE status=%s url=%s title=%s", response.status, response.url, title)
 
-        body_text = clean_text(" ".join(response.css("body *::text").getall()))
-        if body_text:
-            body_text = body_text[:5000]
+        if is_blocked_response(response):
+            self._dump_response(response, "raw_page_blocked")
+            return
 
-        yield RetailerPageItem(
-            retailer_key=retailer_key,
-            page_type=page_type,
-            source_url=strip_tracking(response.url),
-            captured_at=datetime.now(timezone.utc).isoformat(),
-            content_text=body_text,
-            http_status=response.status,
-            scrape_run_id=RUN_ID
+        # Write to pageraw table (via pipeline) + JSONL
+        yield PageRawItem(
+            competitor_key=response.meta["retailer_key"],
+            url=strip_tracking(response.url),
         )
 
     def parse_listing(self, response):
-        retailer_key = response.meta["retailer_key"]
-        category_key = response.meta["category_key"]
         page_no = response.meta.get("page_no", 1)
+        title = clean_text(response.css("title::text").get())
+        self.logger.info("LISTING page=%s status=%s url=%s title=%s", page_no, response.status, response.url, title)
 
-        self.logger.info("LISTING page=%s status=%s url=%s", page_no, response.status, response.url)
+        if is_blocked_response(response):
+            self._dump_response(response, f"listing_p{page_no}_blocked")
+            return
 
         raw_links = response.css(
             "ol.products li.product-item a.product-item-link::attr(href),"
@@ -421,311 +600,146 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         def is_product_url(u: str) -> bool:
             if not u or "maxiaxi.com" not in u:
                 return False
-
             low = u.lower()
-
-            # Drop category itself and irrelevant areas
             if "/microfoons/" in low:
                 return False
             if any(x in low for x in ["/klantenservice", "/advies", "/blog", "/account", "/checkout"]):
                 return False
-
-            # MaxiAxi product URLs often look like:
-            # https://www.maxiaxi.com/<slug>/
             return bool(re.match(r"^https://www\.maxiaxi\.com/[^/]+/?$", u))
 
         product_links = [u for u in links if is_product_url(u)]
-
         self.logger.info("LISTING found_links=%s product_links=%s", len(links), len(product_links))
+
+        if not product_links:
+            self._dump_response(response, f"listing_p{page_no}_no_links")
+            return
 
         for u in product_links:
             yield scrapy.Request(
                 url=u,
                 callback=self.parse_product,
-                meta={"retailer_key": retailer_key, "category_key": category_key}
+                meta={"retailer_key": response.meta["retailer_key"], "category_key": response.meta["category_key"]},
             )
 
-        # Pagination
         if page_no < CONFIG["max_pages_per_category"]:
-            next_href = response.css(
-                "li.pages-item-next a::attr(href), a.action.next::attr(href)"
-            ).get()
-
+            next_href = response.css("li.pages-item-next a::attr(href), a.action.next::attr(href)").get()
             if next_href:
                 next_url = strip_tracking(urljoin(response.url, next_href))
                 yield scrapy.Request(
                     url=next_url,
                     callback=self.parse_listing,
-                    meta={"retailer_key": retailer_key, "category_key": category_key, "page_no": page_no + 1}
+                    meta={
+                        "retailer_key": response.meta["retailer_key"],
+                        "category_key": response.meta["category_key"],
+                        "page_no": page_no + 1,
+                    },
                 )
 
     def parse_product(self, response):
-        retailer_key = response.meta["retailer_key"]
-        category_key = response.meta["category_key"]
+        title = clean_text(response.css("title::text").get())
+        self.logger.info("PRODUCT status=%s url=%s title=%s", response.status, response.url, title)
+
+        if is_blocked_response(response):
+            self._dump_response(response, "product_blocked")
+            return
 
         product_url = strip_tracking(response.url)
 
-        page_title = clean_text(response.css("h1.page-title span::text, h1::text").get())
-        if not page_title:
-            page_title = clean_text(response.css("title::text").get())
+        # product_name (DB column)
+        product_name = clean_text(response.css("h1.page-title span::text, h1::text").get())
+        if not product_name:
+            product_name = clean_text(response.css("title::text").get())
 
-        # Prices
-        price_cur_raw = clean_text(response.css(
-            "span.price-final_price span.price::text,"
-            "span.special-price span.price::text,"
-            "span.price-wrapper span.price::text"
-        ).get() or "")
-
-        price_ref_raw = clean_text(response.css(
-            "span.old-price span.price::text,"
-            "span.regular-price span.price::text"
-        ).get() or "")
-
-        price_current = parse_price(price_cur_raw)
-        price_reference = parse_price(price_ref_raw)
-        discount_pct = calc_discount_pct(price_reference, price_current)
-        promo_flag = int(discount_pct is not None and discount_pct > 0)
-
-        # Stock
-        stock_text_raw = clean_text(" ".join(response.css(
-            ".stock.available *::text, .stock.unavailable *::text, .availability *::text"
-        ).getall()))
-
-        # Delivery promise
-        delivery_promise_text = clean_text(" ".join(response.xpath(
-            "//*[contains(normalize-space(), 'Bestel voor') or contains(normalize-space(), 'morgen')]/text()"
-        ).getall()))
-
-        # Specs extraction
         def value_after_label(label: str):
-            v = response.xpath(
-                f"//th[normalize-space()='{label}']/following-sibling::td[1]//text()"
-            ).getall()
+            v = response.xpath(f"//th[normalize-space()='{label}']/following-sibling::td[1]//text()").getall()
             if v:
                 return clean_text(" ".join(v))
-
-            v2 = response.xpath(
-                f"//*[normalize-space()='{label}']/following::*[1]//text()"
-            ).getall()
+            v2 = response.xpath(f"//*[normalize-space()='{label}']/following::*[1]//text()").getall()
             return clean_text(" ".join(v2)) if v2 else None
 
         brand = value_after_label("Merk")
-        retailer_product_id = value_after_label("SKU")     # mapping SKU -> retailer_product_id
-        gtin_ean = value_after_label("EAN Code")
+        sku = value_after_label("SKU")
+        ean = value_after_label("EAN Code")
 
-        yield ProductObservationItem(
-            retailer_key=retailer_key,
-            category_key=category_key,
-            product_url=product_url,
-            page_title=page_title,
-            retailer_product_id=retailer_product_id,
-            brand=brand,
-            gtin_ean=gtin_ean,
-
-            price_current=price_current,
-            price_reference=price_reference,
-            discount_pct=discount_pct,
-            promo_flag=promo_flag,
-
-            stock_text_raw=stock_text_raw,
-            delivery_promise_text=delivery_promise_text,
-
-            observed_at=datetime.now(timezone.utc).isoformat(),
-            http_status=response.status,
-            scrape_run_id=RUN_ID
+        image_url_on_pdp = clean_text(
+            response.css(
+                "img.fotorama__img::attr(src),"
+                "img.product-image-photo::attr(src),"
+                "meta[property='og:image']::attr(content)"
+            ).get()
         )
-import pandas as pd
 
-# 6. Pipelines
-
-
-class SQLitePipeline:
-    def open_spider(self, spider):
-        self.con = db_connect()
-        self.cur = self.con.cursor()
-
-    def close_spider(self, spider):
-        self.con.commit()
-        self.con.close()
-
-    def _get_retailer_id(self, retailer_key):
-        row = self.cur.execute(
-            "SELECT retailer_id FROM retailer WHERE retailer_key=?",
-            (retailer_key,)
-        ).fetchone()
-        if not row:
-            raise RuntimeError(
-                f"Retailer '{retailer_key}' not found in DB. "
-                "Did you run the seeding cell (upsert_retailers)?"
-            )
-        return row[0]
-
-    def _get_category_id(self, category_key):
-        row = self.cur.execute(
-            "SELECT category_id FROM category WHERE category_key=?",
-            (category_key,)
-        ).fetchone()
-        if not row:
-            raise RuntimeError(
-                f"Category '{category_key}' not found in DB. "
-                "Did you run the seeding cell (seed_categories)?"
-            )
-        return row[0]
-
-    def _upsert_product_page(self, retailer_id, category_id, item):
-        now = datetime.now(timezone.utc).isoformat()
-        self.cur.execute("""
-            INSERT INTO product_page (
-              retailer_id, category_id, url, retailer_product_id, page_title, brand, gtin_ean, last_seen_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(retailer_id, url) DO UPDATE SET
-                retailer_product_id=excluded.retailer_product_id,
-                page_title=excluded.page_title,
-                brand=excluded.brand,
-                gtin_ean=excluded.gtin_ean,
-                last_seen_at=excluded.last_seen_at
-        """, (
-            retailer_id, category_id,
-            item.get("product_url"),
-            item.get("retailer_product_id"),
-            item.get("page_title"),
-            item.get("brand"),
-            item.get("gtin_ean"),
-            now
+        description_clean = clean_text(" ".join(
+            response.css(
+                ".product.attribute.description *::text,"
+                ".product-info-main .value *::text"
+            ).getall()
         ))
-        row = self.cur.execute(
-            "SELECT product_page_id FROM product_page WHERE retailer_id=? AND url=?",
-            (retailer_id, item.get("product_url"))
-        ).fetchone()
-        return row[0]
+        if description_clean:
+            description_clean = description_clean[:5000]
 
-    def process_item(self, item, spider):
-        d = dict(item)
+        # Model signal: MaxiAxi often has SKU that behaves like model
+        model = sku
 
-        # Retailer-level pages (policy/support)
-        if isinstance(item, RetailerPageItem):
-            retailer_id = self._get_retailer_id(d["retailer_key"])
-            self.cur.execute("""
-                INSERT INTO retailer_page_capture (
-                  retailer_id, page_type, source_url, captured_at, content_text, http_status, scrape_run_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                retailer_id,
-                d["page_type"],
-                d["source_url"],
-                d["captured_at"],
-                d.get("content_text"),
-                d.get("http_status"),
-                d["scrape_run_id"]
-            ))
-            self.con.commit()
-            return item
-
-        # Product observation (price/stock/delivery)
-        if isinstance(item, ProductObservationItem):
-            retailer_id = self._get_retailer_id(d["retailer_key"])
-            category_id = self._get_category_id(d["category_key"])
-            pp_id = self._upsert_product_page(retailer_id, category_id, d)
-
-            self.cur.execute("""
-                INSERT INTO offer_observation (
-                  product_page_id, observed_at, price_current, price_reference, discount_pct,
-                  promo_flag, stock_text_raw, delivery_promise_text, currency, http_status, scrape_run_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                pp_id,
-                d["observed_at"],
-                d.get("price_current"),
-                d.get("price_reference"),
-                d.get("discount_pct"),
-                d.get("promo_flag"),
-                d.get("stock_text_raw"),
-                d.get("delivery_promise_text"),
-                CONFIG["currency"],
-                d.get("http_status"),
-                d["scrape_run_id"]
-            ))
-            self.con.commit()
-            return item
-
-        return item
+        yield ProductListingItem(
+            competitor_key=response.meta["retailer_key"],
+            category_name=response.meta["category_key"],
+            product_url=product_url,
+            product_name=product_name,
+            ean=ean,
+            sku=sku,
+            image_url_on_pdp=image_url_on_pdp,
+            description_clean=description_clean,
+            brand=brand,
+            model=model,
+        )
 
 
-class CSVPipeline:
-    def open_spider(self, spider):
-        self.products = []
-        self.pages = []
+# =========================
+# 8) RUN + OPTIONAL DB EXPORT (JSON)
+# =========================
 
-    def close_spider(self, spider):
-        if self.products:
-            dfp = pd.DataFrame(self.products)
-            dfp.to_csv(PROD_CSV_PATH, index=False)
+def run_scrape():
+    process = CrawlerProcess(settings={})
+    process.crawl(CompetitorBenchmarkSpider)
+    process.start()
 
-        if self.pages:
-            dfr = pd.DataFrame(self.pages)
-            dfr.to_csv(RET_CSV_PATH, index=False)
+    print("\nScrape finished.")
+    print("JSONL:", JSONL_PATH)
+    print("DB:", DB_PATH)
+    print("Debug dir:", DEBUG_DIR)
 
-        print("CSV saved to:")
-        if self.products:
-            print("-", PROD_CSV_PATH)
-        if self.pages:
-            print("-", RET_CSV_PATH)
+    # Optional DB export to JSON
+    if DB_PATH.exists():
+        export = {}
+        with db_connect(DB_PATH) as con:
+            for table in [
+                "competitor", "category", "productlisting", "product",
+                "pricesnapshot", "scanresult", "expert_support",
+                "customer_service", "review", "pageraw", "productvendor"
+            ]:
+                if not table_exists(con, table):
+                    continue
+                try:
+                    df = pd.read_sql_query(f"SELECT * FROM {table}", con)
+                    export[table] = df.to_dict(orient="records")
+                except Exception as e:
+                    export[table] = {"_error": str(e)}
 
-    def process_item(self, item, spider):
-        if isinstance(item, ProductObservationItem):
-            self.products.append(dict(item))
-        elif isinstance(item, RetailerPageItem):
-            self.pages.append(dict(item))
-        return item
+        DB_EXPORT_JSON_PATH.write_text(json.dumps(export, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("DB export JSON:", DB_EXPORT_JSON_PATH)
+    else:
+        print("Skipped DB export because DB file does not exist:", DB_PATH)
 
-# 7. Run Spider (ONE run method only)
 
-from scrapy.crawler import CrawlerProcess
+if __name__ == "__main__":
+    print("Setup OK. Timestamp:", datetime.now(timezone.utc).isoformat())
+    print("Config loaded. Retailers:", list(RETAILERS.keys()), "Run:", RUN_ID)
+    print("Seed:", MAXIAXI_MICROFOONS_URL)
+    print("Output dir:", OUT_DIR)
 
-# IMPORTANT:
-# Twisted reactor can only run once per Jupyter kernel.
-# If you want to run the spider again:
-# Kernel -> Restart Kernel -> Run all cells once
+    print("Repo root:", get_repo_root())
+    print("Resolved DB:", DB_PATH)
+    print("DB exists:", DB_PATH.exists())
 
-process = CrawlerProcess(settings={})
-process.crawl(CompetitorBenchmarkSpider)
-process.start()
-
-print("Scrape finished. Outputs saved:")
-print("-", PROD_CSV_PATH)
-print("-", RET_CSV_PATH)
-print("-", DB_PATH)
-
-# 8. Load and QA
-
-import pandas as pd
-
-df_prod = pd.read_csv(PROD_CSV_PATH) if PROD_CSV_PATH.exists() else pd.DataFrame()
-df_ret  = pd.read_csv(RET_CSV_PATH)  if RET_CSV_PATH.exists()  else pd.DataFrame()
-
-display(df_prod.head(10))
-display(df_ret.head(10))
-
-if not df_prod.empty:
-    print("Rows:", len(df_prod))
-    print("\nRows per retailer:")
-    print(df_prod["retailer_key"].value_counts(dropna=False))
-
-    print("\nHTTP status distribution:")
-    print(df_prod["http_status"].value_counts(dropna=False).head(10))
-
-    print("\nMissing price_current %:", round(df_prod["price_current"].isna().mean()*100, 2))
-    print("Discount pct summary:")
-    display(df_prod["discount_pct"].describe())
-
-# 9. Export DB tables
-
-with db_connect() as con:
-    for table in ["retailer", "category", "product_page", "offer_observation", "retailer_page_capture"]:
-        df = pd.read_sql_query(f"SELECT * FROM {table}", con)
-        out = OUTPUT_DIR / f"{table}_{RUN_ID}.csv"
-        df.to_csv(out, index=False)
-        print("Exported:", out, "rows:", len(df))
+    run_scrape()
