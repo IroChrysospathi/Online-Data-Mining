@@ -1,23 +1,28 @@
 """
-bol_products.py (RAW OUTPUT) - UPDATED
+bol_products.py (RAW OUTPUT) - UPDATED + DEBUG DUMP
 
 What’s new vs your original:
-- Adds "Bright Data required" enforcement + run metadata field (brightdata_mode)
-- Adds optional input file with Bax product titles (bax_products.json or JSONL)
-- If bax_json_path is provided: uses Bol search pages to find matching products
-- If not provided: falls back to your original category crawl (microfoons/7119)
+- Enforces Bright Data usage (assignment requirement) and records brightdata_mode in run metadata
+- Optional input file with Bax product titles (JSON array or JSONL). If provided: searches Bol per title
+- If no Bax file: falls back to category crawl (microfoons/7119)
+- Adds debug HTML dump when listing/search pages look blocked (403/429/503 or consent/bot pages)
+  -> saves to ./debug/bol_products_<label>_<status>.html so you can open and see what Bol returned
 
-This works with your existing middleware WITHOUT changes.
+Works with your existing middleware without changes.
 """
+
+from __future__ import annotations
 
 import json
 import os
 import re
 import uuid
 import subprocess
-import scrapy
+from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+import scrapy
 
 
 # -------------------------
@@ -32,7 +37,7 @@ def clean(text):
 
 
 def brightdata_mode() -> str:
-    # Unlocker has priority if token+zone are set (because your middleware returns a Response)
+    # Unlocker has priority if token+zone are set (your middleware returns a Response)
     if os.getenv("BRIGHTDATA_TOKEN") and os.getenv("BRIGHTDATA_ZONE"):
         return "unlocker_api"
     # Proxy mode if full proxy or username+password exist
@@ -118,9 +123,12 @@ def strip_tracking(url: str) -> str:
     try:
         p = urlparse(url)
         q = parse_qs(p.query)
+
+        # bol-ish tracking params you were already dropping
         for k in list(q.keys()):
             if k.lower() in {"cid", "bltgh", "bltg", "blt", "ref", "promo"}:
                 q.pop(k, None)
+
         new_query = urlencode(q, doseq=True)
         return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
     except Exception:
@@ -185,6 +193,18 @@ def extract_prices_from_buyblock_text(full_text: str):
     return current, base
 
 
+def looks_blocked_title(title: str | None) -> bool:
+    if not title:
+        return False
+    t = title.lower()
+    needles = [
+        "toestemming", "consent", "cookie",
+        "verify", "verific", "access denied", "blocked",
+        "captcha", "robot", "attention required",
+    ]
+    return any(n in t for n in needles)
+
+
 # -------------------------
 # spider
 # -------------------------
@@ -213,7 +233,7 @@ class BolProductsSpider(scrapy.Spider):
 
     crawler_version = "bol_products/RAW-2.1-brightdata-input"
 
-    def __init__(self, *args, bax_json_path=None, max_titles=50, **kwargs):
+    def __init__(self, *args, bax_json_path=None, max_titles=50, debug_dump=1, **kwargs):
         super().__init__(*args, **kwargs)
         self.scrape_run_id = str(uuid.uuid4())
         self.started_at = datetime.now(timezone.utc).isoformat()
@@ -229,6 +249,22 @@ class BolProductsSpider(scrapy.Spider):
             self.max_titles = int(max_titles)
         except Exception:
             self.max_titles = 50
+
+        self.debug_dump = str(debug_dump).strip() not in {"0", "false", "False", "no", "NO"}
+
+    # -------- debug dump --------
+
+    def _dump_response(self, response, label: str):
+        if not self.debug_dump:
+            return
+        try:
+            out_dir = Path("debug")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fn = out_dir / f"{self.name}_{label}_{response.status}.html"
+            fn.write_bytes(response.body or b"")
+            self.logger.warning("Saved debug HTML to %s", fn.resolve())
+        except Exception as exc:
+            self.logger.warning("Could not save debug HTML err=%s", exc)
 
     # -------- input loader --------
 
@@ -321,7 +357,12 @@ class BolProductsSpider(scrapy.Spider):
     # -------- search parsing (NEW) --------
 
     def parse_search(self, response):
-        self.logger.info("SEARCH status=%s url=%s", response.status, response.url)
+        title = clean(response.css("title::text").get())
+        self.logger.info("SEARCH status=%s url=%s title=%s", response.status, response.url, title)
+
+        if response.status in (403, 429, 503) or looks_blocked_title(title):
+            self._dump_response(response, "search_blocked")
+            return
 
         query_title = response.meta.get("query_title")
 
@@ -334,6 +375,11 @@ class BolProductsSpider(scrapy.Spider):
         links = [strip_tracking(response.urljoin(h)) for h in links if h]
         links = list(dict.fromkeys(links))
 
+        if not links:
+            # save HTML so you can inspect what Bol returned
+            self._dump_response(response, "search_no_links")
+            return
+
         # Keep crawl bounded: take first few results per Bax title
         for url in links[:5]:
             yield response.follow(url, callback=self.parse_product, meta={"query_title": query_title})
@@ -341,7 +387,12 @@ class BolProductsSpider(scrapy.Spider):
     # -------- original category crawl --------
 
     def parse(self, response):
-        self.logger.info("LISTING status=%s url=%s", response.status, response.url)
+        title = clean(response.css("title::text").get())
+        self.logger.info("LISTING status=%s url=%s title=%s", response.status, response.url, title)
+
+        if response.status in (403, 429, 503) or looks_blocked_title(title):
+            self._dump_response(response, "listing_blocked")
+            return
 
         # Emit subcategories (only once, from the seed page)
         if not self._seed_emitted and "microfoons/7119" in response.url:
@@ -357,6 +408,10 @@ class BolProductsSpider(scrapy.Spider):
 
         links = [strip_tracking(response.urljoin(h)) for h in links if h]
         links = list(dict.fromkeys(links))
+
+        if not links:
+            self._dump_response(response, "listing_no_links")
+            return
 
         for url in links:
             yield response.follow(url, callback=self.parse_product)
@@ -642,9 +697,13 @@ class BolProductsSpider(scrapy.Spider):
 
         # Ratings fallback
         if not item["rating_value"] or not item["review_count"]:
-            rating_text = clean(" ".join(response.css(
-                '[data-test*="rating"] *::text, a[href*="reviews"] *::text, [href*="#review"] *::text'
-            ).getall())) or ""
+            rating_text = clean(
+                " ".join(
+                    response.css(
+                        '[data-test*="rating"] *::text, a[href*="reviews"] *::text, [href*="#review"] *::text'
+                    ).getall()
+                )
+            ) or ""
             if not item["rating_value"]:
                 m = re.search(r"\b(\d(?:[.,]\d)?)\b", rating_text)
                 if m:
@@ -656,7 +715,9 @@ class BolProductsSpider(scrapy.Spider):
 
         # Breadcrumb HTML fallback
         if not item["breadcrumb_url"] or not looks_like_category_url(item["breadcrumb_url"]):
-            crumb_texts = response.css('nav a[href]::text, ol a[href]::text, a[data-test*="breadcrumb"]::text').getall()
+            crumb_texts = response.css(
+                'nav a[href]::text, ol a[href]::text, a[data-test*="breadcrumb"]::text'
+            ).getall()
             crumb_hrefs = response.css(
                 'nav a[href]::attr(href), ol a[href]::attr(href), a[data-test*="breadcrumb"]::attr(href)'
             ).getall()

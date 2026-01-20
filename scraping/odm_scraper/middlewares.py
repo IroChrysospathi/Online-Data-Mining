@@ -4,7 +4,14 @@ Scrapy middlewares.
 Responsibilities:
 - Optionally modify requests and responses
 - Handle headers, retries, or custom crawling behavior
-- This file may remain unused if default Scrapy behavior is sufficient
+
+Bright Data integration:
+- Proxy middleware: sets request.meta["proxy"] using BRIGHTDATA_* env vars
+- Unlocker API middleware: fetches page via Bright Data Web Unlocker API
+
+IMPORTANT FIX:
+- Web Unlocker expects payload like: {"zone": "...", "url": "...", "format": "raw"}
+- Do NOT send "method" (can cause 400 Bad Request)
 """
 
 from __future__ import annotations
@@ -60,14 +67,16 @@ class BrightDataUnlockerAPIMiddleware:
         return cls(token, zone)
 
     def process_request(self, request, spider):
+        # If not configured, let Scrapy download normally (or proxy middleware handle it)
         if not self.token or not self.zone:
             return None
 
+        # Match Bright Data's working example payload
         payload = {
             "zone": self.zone,
             "url": request.url,
-            "format": "raw",
-            "method": request.method,
+            "format": "raw",  # recommended for Scrapy; returns the HTML bytes
+            # DO NOT include "method" here (can trigger 400 on Web Unlocker)
         }
 
         try:
@@ -83,6 +92,15 @@ class BrightDataUnlockerAPIMiddleware:
         except Exception as exc:
             spider.logger.warning("brightdata unlocker error url=%s err=%s", request.url, exc)
             return None
+
+        # If Bright Data returns an error, log the message body (super helpful for debugging)
+        if resp.status_code >= 400:
+            spider.logger.error(
+                "BrightData API error status=%s url=%s body=%s",
+                resp.status_code,
+                request.url,
+                (resp.text or "")[:800],
+            )
 
         return HtmlResponse(
             url=request.url,
