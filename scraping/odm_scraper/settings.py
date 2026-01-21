@@ -1,13 +1,4 @@
-"""
-Global Scrapy settings.
-
-- Enables Bright Data middlewares (Proxy + Unlocker)
-- Ensures blocked responses (403/429) reach the spider
-- Stable configuration for Bol.com
-"""
-
 from pathlib import Path
-
 
 BOT_NAME = "odm_scraper"
 
@@ -21,7 +12,6 @@ NEWSPIDER_MODULE = "odm_scraper.spiders"
 # --------------------
 # Crawling behaviour
 # --------------------
-
 ROBOTSTXT_OBEY = True
 
 DOWNLOAD_DELAY = 2
@@ -36,7 +26,6 @@ DOWNLOAD_TIMEOUT = 60
 # --------------------
 # Identity
 # --------------------
-
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -55,7 +44,6 @@ COOKIES_ENABLED = False
 # --------------------
 # IMPORTANT: allow blocked responses
 # --------------------
-
 HTTPERROR_ALLOWED_CODES = [403, 429, 500, 502, 503]
 
 RETRY_ENABLED = True
@@ -65,39 +53,35 @@ RETRY_HTTP_CODES = [403, 429, 500, 502, 503, 504]
 # --------------------
 # Bright Data middlewares
 # --------------------
-
 DOWNLOADER_MIDDLEWARES = {
-    "odm_scraper.middlewares.BrightDataUnlockerAPIMiddleware": 540,
-    "odm_scraper.middlewares.BrightDataProxyMiddleware": 610,
+    # Keep this if you need Scrapy to apply USER_AGENT automatically
+    "scrapy.downloadermiddlewares.useragent.UserAgentMiddleware": 400,
+
+    "odm_scraper.middlewares.BrightDataUnlockerAPIMiddleware": 543,
+
+    # Enable this when not testing:
+    # "odm_scraper.middlewares.BrightDataProxyMiddleware": 610,
+
+    "scrapy.downloadermiddlewares.retry.RetryMiddleware": 550,
+    "scrapy.downloadermiddlewares.redirect.RedirectMiddleware": 600,
+
+    # Remove if COOKIES_ENABLED = False
+    # "scrapy.downloadermiddlewares.cookies.CookiesMiddleware": 700,
+
+    # Keep if your proxy middleware sets request.meta["proxy"]
+    "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 800,
 }
 
 # --------------------
 # Pipelines
 # --------------------
-
 ITEM_PIPELINES = {
     "odm_scraper.pipelines.InitDbPipeline": 100,
 }
 
-<<<<<<< HEAD
 FEEDS = {
     str(RAW_DATA_DIR / "%(name)s.json"): {
         "format": "jsonlines",
         "encoding": "utf-8",
     }
-=======
-
-DOWNLOADER_MIDDLEWARES = {
-    "scrapy.downloadermiddlewares.useragent.UserAgentMiddleware": 400,
-
-    "odm_scraper.middlewares.BrightDataUnlockerAPIMiddleware": 543,
-
-    # comment out / remove this for the test:
-    # "odm_scraper.middlewares.BrightDataProxyMiddleware": 750,
-
-    "scrapy.downloadermiddlewares.retry.RetryMiddleware": 550,
-    "scrapy.downloadermiddlewares.redirect.RedirectMiddleware": 600,
-    "scrapy.downloadermiddlewares.cookies.CookiesMiddleware": 700,
-    "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 800,
->>>>>>> 9bf4f49123bca26104a65622fda562bd3f613dae
 }

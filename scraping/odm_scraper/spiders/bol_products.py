@@ -686,11 +686,15 @@ class BolProductsSpider(scrapy.Spider):
     custom_settings = {
         "ROBOTSTXT_OBEY": False,
         "DOWNLOAD_TIMEOUT": 45,
-        "RETRY_TIMES": 2,
         "AUTOTHROTTLE_ENABLED": True,
         "AUTOTHROTTLE_START_DELAY": 1.0,
         "AUTOTHROTTLE_MAX_DELAY": 10.0,
-        "CLOSESPIDER_PAGECOUNT": 400,
+        "CLOSESPIDER_PAGECOUNT": 3000,  # enough for listings + ~1k products
+        "CONCURRENT_REQUESTS": 8,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 8,
+        "RETRY_TIMES": 4,
+        "DOWNLOAD_DELAY": 0.1,
+        "RANDOMIZE_DOWNLOAD_DELAY": True,
     }
 
     crawler_version = "bol_products/ERD-STRICT-1.0"
@@ -713,6 +717,10 @@ class BolProductsSpider(scrapy.Spider):
         self._seen_category_key = set()
         self._seen_listing_key = set()
         self._seen_product_key = set()
+        self._scheduled_listing_pages = set()   # int page numbers we already queued
+        self._seen_pagelink_key = set()         # for PAGELINK dedupe
+        self.max_listing_pages = None           # discovered from pagination (e.g. 74)
+
 
         self.seed_category_url = strip_tracking(self.start_urls[0])
 
@@ -969,8 +977,61 @@ class BolProductsSpider(scrapy.Spider):
             "scrape_run_key": self.scrape_run_key,
         }
 
-    # crawl entry 
+    def emit_pagelink(self, *, url: str, page_type: str, referrer: str | None = None, depth: int | None = None):
+        url = strip_tracking(url)
+        if not url:
+            return
 
+        key_src = f"{page_type}|{url}|{referrer or ''}"
+        pagelink_key = stable_int_key(key_src)
+
+        if pagelink_key in self._seen_pagelink_key:
+            return
+        self._seen_pagelink_key.add(pagelink_key)
+
+        yield {
+            "type": "PAGELINK",
+            "url": url,
+            "page_type": page_type,          # "LISTING" or "PRODUCT"
+            "referrer_url": clean(referrer),
+            "depth": depth,
+            "pagelink_key": pagelink_key,
+            "scrape_run_key": self.scrape_run_key,
+        }
+
+    def _build_listing_page_url(self, base_url: str, page: int) -> str:
+        u = urlparse(base_url)
+        q = parse_qs(u.query)
+        q["page"] = [str(page)]
+        return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q, doseq=True), ""))
+
+    def _detect_max_page(self, response) -> int:
+        # Grab all pagination hrefs that include page=
+        pages = []
+        for href in response.css('a[href*="page="]::attr(href)').getall():
+            try:
+                absu = response.urljoin(href)
+                q = parse_qs(urlparse(absu).query)
+                if "page" in q:
+                    pages.append(int(q["page"][0]))
+            except Exception:
+                pass
+
+    # Fallback: parse pagination numbers from visible text near the bottom
+        if not pages:
+            text = " ".join(response.css("body *::text").getall())
+            # common pattern: "... 74" as last page
+            for m in re.finditer(r"\b(\d{1,3})\b", text[-6000:]):  # last chunk only
+                try:
+                    n = int(m.group(1))
+                    if 1 <= n <= 300:
+                        pages.append(n)
+                except Exception:
+                    pass
+
+        return max(pages) if pages else 1  
+
+    # crawl entry 
     def start_requests(self):
         if self.bd_mode == "disabled":
             raise RuntimeError(
@@ -990,28 +1051,57 @@ class BolProductsSpider(scrapy.Spider):
         yield from self.emit_scraperun()
         yield from self.emit_category(url=self.seed_category_url, name="Microfoons")
 
+        page1 = self._build_listing_page_url(self.seed_category_url, 1)
+        meta = self._base_meta()
+        meta["listing_page"] = 1
+
         yield scrapy.Request(
-            self.seed_category_url,
+            page1,
             callback=self.parse_listing,
-            meta=self._base_meta(),
+            meta=meta,
             dont_filter=True,
         )
 
     # listing parsing 
     def parse_listing(self, response):
         response = self.maybe_render(response, reason="listing")
+        #yield from self.emit_pagelink(url=response.url, page_type="LISTING", referrer=self.seed_category_url, depth=0)
+        yield from self.emit_pagelink(url=url, page_type="PRODUCT", referrer=response.url, depth=1)
 
         if "bol.com" not in response.url:
             return
 
+        meta = dict(response.meta)
+        current_page = int(meta.get("listing_page") or 1)
+
+        # 1) Discover max pages once (from pagination)
+        if self.max_listing_pages is None:
+            self.max_listing_pages = self._detect_max_page(response)
+            self.logger.info("Detected max listing pages: %s", self.max_listing_pages)
+
+        # 2) Schedule remaining pages deterministically (2..max)
+        #    (This is the key fix: don't rely on rel=next)
+        for p in range(1, int(self.max_listing_pages) + 1):
+            if p in self._scheduled_listing_pages:
+                continue
+            self._scheduled_listing_pages.add(p)
+
+            page_url = self._build_listing_page_url(self.seed_category_url, p)
+            m2 = dict(meta)
+            m2["listing_page"] = p
+            yield scrapy.Request(page_url, callback=self.parse_listing, meta=m2, dont_filter=True)
+
+        # 3) Extract product links (your existing approach + stronger fallback)
         links = response.css('a[data-test="product-title"]::attr(href)').getall()
         if not links:
             links = response.css('a[href*="/nl/nl/p/"]::attr(href)').getall()
 
+        # Fallback: regex grab /p/ links if HTML is weird/partial
+        if not links:
+            links = re.findall(r'href="([^"]+/nl/nl/p/[^"]+)"', response.text or "")
+
         links = [strip_tracking(response.urljoin(h)) for h in links if h]
         links = list(dict.fromkeys(links))
-
-        meta = dict(response.meta)
 
         for url in links:
             yield response.follow(url, callback=self.parse_product, meta=meta)
@@ -1310,3 +1400,5 @@ class BolProductsSpider(scrapy.Spider):
                 match_score=match_score,
                 matched_at=scraped_at,
             )
+    
+                
