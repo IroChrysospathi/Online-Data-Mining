@@ -5,7 +5,7 @@ import os
 import sqlite3
 from typing import Optional
 
-# Hardcoded competitors (based on your ERD screenshot)
+# Hardcoded competitors 
 COMPETITORS = [
     (1, "Bax-shop", "NL", "https://www.bax-shop.nl"),
     (2, "bol.com", "NL", "https://www.bol.com"),
@@ -55,9 +55,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
     """
     conn.executescript(
         """
-        -- =========================
-        -- 1) COMPETITOR
-        -- =========================
+        -- COMPETITOR
         CREATE TABLE IF NOT EXISTS competitor (
           competitor_id INTEGER PRIMARY KEY,
           name          VARCHAR(100) NOT NULL,
@@ -65,9 +63,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
           base_url      VARCHAR(200)
         );
 
-        -- =========================
-        -- 2) SCRAPERUN
-        -- =========================
+        -- SCRAPERUN
         CREATE TABLE IF NOT EXISTS scraperun (
           scrape_run_id     INTEGER PRIMARY KEY AUTOINCREMENT,
           started_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -76,11 +72,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
           notes             TEXT
         );
 
-        -- =========================
-        -- 3) CATEGORY
-        -- NOTE: Your ERD looks like "category_id" is intended as the key because
-        --       productlisting.category_id is INTEGER and parent_category_id is INTEGER.
-        -- =========================
+        -- CATEGORY
         CREATE TABLE IF NOT EXISTS category (
           category_id         INTEGER PRIMARY KEY AUTOINCREMENT,
           competitor_id       INTEGER NOT NULL REFERENCES competitor(competitor_id),
@@ -90,9 +82,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
           FOREIGN KEY(parent_category_id) REFERENCES category(category_id)
         );
 
-        -- =========================
-        -- 4) PRODUCTLISTING
-        -- =========================
+        -- PRODUCTLISTING
         CREATE TABLE IF NOT EXISTS productlisting (
           listing_id            INTEGER PRIMARY KEY AUTOINCREMENT,
           competitor_id         INTEGER NOT NULL REFERENCES competitor(competitor_id),
@@ -105,9 +95,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
           description_clean     TEXT
         );
 
-        -- =========================
-        -- 5) PRICESNAPSHOT
-        -- =========================
+        -- PRICESNAPSHOT
         CREATE TABLE IF NOT EXISTS pricesnapshot (
           price_snapshot_id  INTEGER PRIMARY KEY AUTOINCREMENT,
           listing_id         INTEGER NOT NULL REFERENCES productlisting(listing_id),
@@ -123,9 +111,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
           stock_status_text  VARCHAR(50)
         );
 
-        -- =========================
-        -- 6) PRODUCT
-        -- =========================
+        -- PRODUCT
         CREATE TABLE IF NOT EXISTS product (
           product_id      INTEGER PRIMARY KEY AUTOINCREMENT,
           canonical_name  VARCHAR(200) NOT NULL,
@@ -133,9 +119,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
           model           VARCHAR(100)
         );
 
-        -- =========================
-        -- 7) PRODUCTMATCH
-        -- =========================
+        -- PRODUCTMATCH
         CREATE TABLE IF NOT EXISTS productmatch (
           match_id      INTEGER PRIMARY KEY AUTOINCREMENT,
           product_id    INTEGER NOT NULL REFERENCES product(product_id),
@@ -145,9 +129,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
           matched_at    TIMESTAMP
         );
 
-        -- =========================
-        -- 8) REVIEW
-        -- =========================
+        -- REVIEW
         CREATE TABLE IF NOT EXISTS review (
           review_id          INTEGER PRIMARY KEY AUTOINCREMENT,
           listing_id         INTEGER NOT NULL REFERENCES productlisting(listing_id),
@@ -162,9 +144,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
           review_url         VARCHAR(500)
         );
 
-        -- =========================
-        -- 9) PAGELINK
-        -- =========================
+        -- PAGELINK
         CREATE TABLE IF NOT EXISTS pagelink (
           page_id        INTEGER PRIMARY KEY AUTOINCREMENT,
           competitor_id  INTEGER NOT NULL REFERENCES competitor(competitor_id),
@@ -172,9 +152,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
           url            VARCHAR(500)
         );
 
-        -- =========================
-        -- 10) CUSTOMER_SERVICE
-        -- =========================
+        -- CUSTOMER_SERVICE
         CREATE TABLE IF NOT EXISTS customer_service (
           customer_service_id         INTEGER PRIMARY KEY AUTOINCREMENT,
           competitor_id               INTEGER NOT NULL REFERENCES competitor(competitor_id),
@@ -192,9 +170,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
           customer_service_url        TEXT
         );
 
-        -- =========================
-        -- 11) EXPERT_SUPPORT
-        -- =========================
+        -- EXPERT_SUPPORT
         CREATE TABLE IF NOT EXISTS expert_support (
           expert_support_id       INTEGER PRIMARY KEY AUTOINCREMENT,
           competitor_id           INTEGER NOT NULL REFERENCES competitor(competitor_id),
@@ -243,7 +219,7 @@ if __name__ == "__main__":
     conn = connect()
     init_db(conn)
 
-    # Print tables to prove it worked
+    # Print tables 
     rows = conn.execute("""
         SELECT name
         FROM sqlite_master
