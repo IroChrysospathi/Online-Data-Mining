@@ -3,6 +3,7 @@
 # Writes to existing repo SQLite DB (db/odm.sqlite) + JSONL output
 # Blocked-page detection + debug HTML dump
 # NO CSV output
+# Dual export: repo + desktop
 # =========================
 
 import json
@@ -56,28 +57,17 @@ RETAILERS = {
 
 
 # =========================
-# 2) OUTPUT PATHS (JSON + DEBUG)
-# =========================
-
-DEFAULT_OUT_DIR = "~/Desktop/Assignment/Onlune-Data-Mining/data/raw/maxiaxi"
-OUT_DIR = Path(os.getenv("OUTPUT_DIR", DEFAULT_OUT_DIR)).expanduser()
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-DEBUG_DIR = OUT_DIR / "debug"
-DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-
-JSONL_PATH = OUT_DIR / f"maxiaxi_items_{RUN_ID}.jsonl"
-DB_EXPORT_JSON_PATH = OUT_DIR / f"odm_db_export_{RUN_ID}.json"
-
-
-# =========================
-# 3) DATABASE (CONNECT TO EXISTING REPO DB)
+# 2) DATABASE (CONNECT TO EXISTING REPO DB)
 # =========================
 
 def get_repo_root() -> Path:
     gh = os.getenv("GITHUB_WORKSPACE")
     if gh:
         return Path(gh).resolve()
+
+    # Notebook / interactive fallback
+    if "__file__" not in globals():
+        return Path.cwd().resolve()
 
     p = Path(__file__).resolve()
     if p.parent.name.lower() == "scraping":
@@ -190,6 +180,42 @@ def ensure_category_row(
 
 
 # =========================
+# 3) OUTPUT PATHS (JSON + DEBUG)  — dual export: repo + desktop
+# =========================
+
+# Desktop target (your original location)
+DESKTOP_OUT_DIR = Path("~/Desktop/Assignment/Onlune-Data-Mining/data/raw/maxiaxi").expanduser()
+
+# Repo target
+REPO_OUT_DIR = (get_repo_root() / "data" / "raw" / "maxiaxi").resolve()
+
+# Optional override for primary output dir
+PRIMARY_OUT_DIR = Path(os.getenv("OUTPUT_DIR", str(REPO_OUT_DIR))).expanduser().resolve()
+
+# All export destinations (deduped, ordered)
+EXPORT_DIRS: list[Path] = []
+for d in [PRIMARY_OUT_DIR, REPO_OUT_DIR, DESKTOP_OUT_DIR]:
+    d = d.expanduser().resolve()
+    if d not in EXPORT_DIRS:
+        EXPORT_DIRS.append(d)
+
+for d in EXPORT_DIRS:
+    d.mkdir(parents=True, exist_ok=True)
+
+# Primary dir is used during crawling (debug dumps go here)
+OUT_DIR = PRIMARY_OUT_DIR
+
+DEBUG_DIR = OUT_DIR / "debug"
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+JSONL_NAME = f"maxiaxi_items_{RUN_ID}.jsonl"
+DB_EXPORT_JSON_NAME = f"odm_db_export_{RUN_ID}.json"
+
+JSONL_PATH = OUT_DIR / JSONL_NAME
+DB_EXPORT_JSON_PATH = OUT_DIR / DB_EXPORT_JSON_NAME
+
+
+# =========================
 # 4) HELPERS
 # =========================
 
@@ -243,6 +269,36 @@ def is_blocked_response(response: scrapy.http.Response) -> bool:
     if looks_blocked_title(title):
         return True
     return False
+
+
+def copy_file_to_dirs(src: Path, dirs: list[Path]) -> list[Path]:
+    """
+    Copy src file into each directory in dirs, keeping filename.
+    Returns list of written destination paths.
+    """
+    written: list[Path] = []
+    if not src.exists():
+        return written
+
+    import shutil
+
+    for d in dirs:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            dst = d / src.name
+
+            # Avoid copying onto itself
+            if dst.resolve() == src.resolve():
+                written.append(dst)
+                continue
+
+            shutil.copy2(src, dst)
+            written.append(dst)
+        except Exception:
+            # Keep scraping resilient; best-effort copies
+            pass
+
+    return written
 
 
 # =========================
@@ -448,7 +504,6 @@ class SQLitePipeline:
             model = clean_text(d.get("model"))
             product_name = clean_text(d.get("product_name"))
 
-            canonical_name = None
             if brand and model:
                 canonical_name = f"{brand} {model}"
             else:
@@ -476,7 +531,8 @@ class JSONLPipeline:
             "repo_root": str(get_repo_root()),
             "db_path": str(DB_PATH),
             "db_exists": DB_PATH.exists(),
-            "output_dir": str(OUT_DIR),
+            "output_dir_primary": str(OUT_DIR),
+            "output_dirs_all": [str(d) for d in EXPORT_DIRS],
             "debug_dump": CONFIG["debug_dump"],
             "config": {
                 "max_pages_per_category": CONFIG["max_pages_per_category"],
@@ -493,7 +549,14 @@ class JSONLPipeline:
             self.f.close()
         except Exception:
             pass
-        print("JSONL saved to:", JSONL_PATH)
+
+        copies = copy_file_to_dirs(JSONL_PATH, EXPORT_DIRS)
+
+        print("JSONL saved to (primary):", JSONL_PATH)
+        if copies:
+            print("JSONL also copied to:")
+            for p in copies:
+                print("-", p)
 
     def process_item(self, item, spider):
         now = datetime.now(timezone.utc).isoformat()
@@ -527,6 +590,8 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         "ROBOTSTXT_OBEY": True,
         "ITEM_PIPELINES": {
             "__main__.JSONLPipeline": 400,
+            # If you want DB writes too, enable this:
+            # "__main__.SQLitePipeline": 300,
         },
     }
 
@@ -574,7 +639,6 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
             self._dump_response(response, "raw_page_blocked")
             return
 
-        # Write to pageraw table (via pipeline) + JSONL
         yield PageRawItem(
             competitor_key=response.meta["retailer_key"],
             url=strip_tracking(response.url),
@@ -645,7 +709,6 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
 
         product_url = strip_tracking(response.url)
 
-        # product_name (DB column)
         product_name = clean_text(response.css("h1.page-title span::text, h1::text").get())
         if not product_name:
             product_name = clean_text(response.css("title::text").get())
@@ -678,7 +741,6 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         if description_clean:
             description_clean = description_clean[:5000]
 
-        # Model signal: MaxiAxi often has SKU that behaves like model
         model = sku
 
         yield ProductListingItem(
@@ -705,9 +767,12 @@ def run_scrape():
     process.start()
 
     print("\nScrape finished.")
-    print("JSONL:", JSONL_PATH)
+    print("Primary JSONL:", JSONL_PATH)
     print("DB:", DB_PATH)
     print("Debug dir:", DEBUG_DIR)
+    print("All export dirs:")
+    for d in EXPORT_DIRS:
+        print("-", d)
 
     # Optional DB export to JSON
     if DB_PATH.exists():
@@ -727,7 +792,14 @@ def run_scrape():
                     export[table] = {"_error": str(e)}
 
         DB_EXPORT_JSON_PATH.write_text(json.dumps(export, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("DB export JSON:", DB_EXPORT_JSON_PATH)
+
+        copies = copy_file_to_dirs(DB_EXPORT_JSON_PATH, EXPORT_DIRS)
+
+        print("DB export JSON saved to (primary):", DB_EXPORT_JSON_PATH)
+        if copies:
+            print("DB export JSON also copied to:")
+            for p in copies:
+                print("-", p)
     else:
         print("Skipped DB export because DB file does not exist:", DB_PATH)
 
@@ -736,10 +808,14 @@ if __name__ == "__main__":
     print("Setup OK. Timestamp:", datetime.now(timezone.utc).isoformat())
     print("Config loaded. Retailers:", list(RETAILERS.keys()), "Run:", RUN_ID)
     print("Seed:", MAXIAXI_MICROFOONS_URL)
-    print("Output dir:", OUT_DIR)
 
     print("Repo root:", get_repo_root())
     print("Resolved DB:", DB_PATH)
     print("DB exists:", DB_PATH.exists())
+
+    print("Primary output dir:", OUT_DIR)
+    print("All export dirs:")
+    for d in EXPORT_DIRS:
+        print("-", d)
 
     run_scrape()
