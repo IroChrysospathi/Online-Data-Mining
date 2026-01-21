@@ -1,21 +1,7 @@
 """
-bol_support.py (UPDATED)
-
-- Bright Data proxy support (meta["proxy"])
-- Selenium fallback for consent/shell pages
-- Exports DB-aligned items:
-  - CUSTOMER_SERVICE -> columns match customer_service table
-  - EXPERT_SUPPORT   -> columns match expert_support table
-
-Input:
-- Use your bol_products.jsonl as input_file to get product URLs.
-
 Output JSONL items:
 - type = "CUSTOMER_SERVICE"
 - type = "EXPERT_SUPPORT"
-
-Linking:
-- Exports listing_key (stable int hash of product_url) so you can map to productlisting.listing_id.
 """
 
 from __future__ import annotations
@@ -31,11 +17,7 @@ from urllib.parse import urlparse
 
 import scrapy
 
-
-# -------------------------
 # Helpers
-# -------------------------
-
 def iso_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -87,11 +69,7 @@ def text_has_any(text, words):
     t = (text or "").lower()
     return any(w.lower() in t for w in words)
 
-
-# -------------------------
 # Bright Data proxy handling
-# -------------------------
-
 def brightdata_proxy_url() -> str | None:
     """
     Supports either:
@@ -113,11 +91,7 @@ def brightdata_proxy_url() -> str | None:
 
     return None
 
-
-# -------------------------
 # Selenium fallback
-# -------------------------
-
 BLOCKED_MARKERS = [
     "this is a modal window",
     "beginning of dialog window",
@@ -210,11 +184,7 @@ def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
     finally:
         driver.quit()
 
-
-# -------------------------
 # Spider
-# -------------------------
-
 class BolSupportSpider(scrapy.Spider):
     name = "bol_support"
     allowed_domains = ["bol.com"]
@@ -249,7 +219,7 @@ class BolSupportSpider(scrapy.Spider):
 
         self.proxy_url = brightdata_proxy_url()
 
-        # Defaults (best-effort assumptions)
+        # Defaults 
         self.global_free_shipping_threshold_amt = None
         self.global_cooling_off_days = 30
 
@@ -263,7 +233,7 @@ class BolSupportSpider(scrapy.Spider):
         self.product_rows = self._load_products(self.input_file)
         self.logger.info("Loaded %s product URLs from input_file=%s", len(self.product_rows), self.input_file)
 
-    # ----- input loading -----
+    # input loading
 
     def _load_products(self, path):
         rows = []
@@ -281,7 +251,7 @@ class BolSupportSpider(scrapy.Spider):
             if not isinstance(obj, dict):
                 return
 
-            # accept productlisting items from your bol_products.jsonl
+            # accept productlisting items from bol_products.jsonl
             t = obj.get("type")
             if t and t not in {"PRODUCTLISTING"}:
                 return
@@ -330,7 +300,7 @@ class BolSupportSpider(scrapy.Spider):
         self.logger.error("Unsupported input_file extension: %s", ext)
         return rows
 
-    # ----- helpers -----
+    # helpers 
 
     def _base_meta(self):
         m = {}
@@ -355,7 +325,7 @@ class BolSupportSpider(scrapy.Spider):
             self.logger.warning("Selenium render failed url=%s err=%s", response.url, exc)
             return response
 
-    # ----- crawl -----
+    # crawl 
 
     def start_requests(self):
         if not self.product_rows:
@@ -364,7 +334,7 @@ class BolSupportSpider(scrapy.Spider):
 
         meta = self._base_meta()
 
-        # first try to parse global defaults from support pages, then schedule products
+        # first parse global defaults from support pages, then schedule products
         yield scrapy.Request(
             self.support_seed_urls[0],
             callback=self.parse_support_then_schedule,
@@ -423,10 +393,7 @@ class BolSupportSpider(scrapy.Spider):
 
         full_text = clean(" ".join(response.css("body *::text").getall())) or ""
 
-        # -------------------------
         # CUSTOMER_SERVICE (DB columns)
-        # -------------------------
-
         shipping_included = None
         if text_has_any(full_text, ["gratis verzending", "gratis bezorging", "gratis geleverd"]):
             shipping_included = True
@@ -498,13 +465,10 @@ class BolSupportSpider(scrapy.Spider):
             "warranty_duration_months": warranty_duration_months,
             "customer_service_url": customer_service_url,
             "listing_key": listing_key,     # helper for joining to productlisting
-            "product_url": product_url,     # helper (optional)
+            "product_url": product_url,     
         }
 
-        # -------------------------
         # EXPERT_SUPPORT (DB columns)
-        # -------------------------
-
         sold_by_bol = False
         if seller_text:
             sold_by_bol = ("bol.com" in seller_text.lower()) or (seller_text.lower().strip() in {"bol", "bolcom"})
@@ -529,7 +493,7 @@ class BolSupportSpider(scrapy.Spider):
 
         in_store_support = False  # bol has no stores
 
-        # Keep a compact support snippet
+        # a compact support snippet
         expert_support_text = clean(full_text[:4000])
 
         yield {
