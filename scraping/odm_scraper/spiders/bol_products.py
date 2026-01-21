@@ -1,18 +1,5 @@
-# bol_products.py
 # Scrapy spider that ONLY crawls https://www.bol.com/nl/nl/l/microfoons/7119/
-# and emits ERD-aligned rows for microphone products.
-#
-# Improvements in this version:
-# - Much stronger “blocked/modal/consent shell” detection
-# - Selenium fallback triggers when HTML is clearly not a real product/listing page
-# - Selenium waits for real selectors (title/price/buy block), tries to accept cookies
-# - Extracts title/description/price/stock also from JSON-LD (offers.*) when available
-# - Better price/stock selectors + better description cleanup
-#
-# NEW IN THIS UPDATE (your request):
-# - Stronger price extraction (handles split price, meta/itemprop, embedded JSON, aria-labels)
-# - Stronger stock extraction + explicit YES/NO label + scraping "In stock" badge/text
-#
+
 # Output items (JSON lines):
 # - SCRAPERUN
 # - CATEGORY (ONLY seed)
@@ -32,14 +19,9 @@ import subprocess
 import hashlib
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-
 import scrapy
 
-
-# -------------------------
 # Microphone category constraints (breadcrumbs only)
-# -------------------------
-
 ALLOWED_CATEGORY_KEYWORDS = {
     "microfoons",
     "studiomicrofoon",
@@ -71,12 +53,7 @@ EXCLUDED_CATEGORY_KEYWORDS = {
     "voorversterker", "voorversterkers",
     "vocal-effect", "vocal-effecten",
 }
-
-
-# -------------------------
 # Product-level microphone filter
-# -------------------------
-
 MIC_INCLUDE_WORDS = {
     "microfoon", "microfoons", "microphone", "mic",
     "lavalier", "dasspeld",
@@ -100,11 +77,7 @@ MIC_EXCLUDE_WORDS = {
     "popfilter", "windkap",
 }
 
-
-# -------------------------
 # helpers
-# -------------------------
-
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -125,7 +98,7 @@ def get_git_commit_hash():
 
 
 def brightdata_mode() -> str:
-    # Unlocker has priority if token+zone are set
+    # Unlocker has priority if token+zone are set (API)
     if os.getenv("BRIGHTDATA_TOKEN") and os.getenv("BRIGHTDATA_ZONE"):
         return "unlocker_api"
     # Proxy mode if full proxy or username+password exist
@@ -150,11 +123,7 @@ def strip_tracking(url: str) -> str:
     except Exception:
         return url
 
-
-# -------------------------
-# PRICE parsing (ENHANCED)
-# -------------------------
-
+# PRICE parsing 
 _PRICE_RX = re.compile(r"(\d{1,3}(?:[.\s]\d{3})*|\d+)(?:[.,](\d{1,2}))?")
 
 def price_to_float(text: str | None):
@@ -271,7 +240,7 @@ def extract_prices_from_ld(product_node: dict | None):
     if isinstance(ps, list) and ps:
         ps = ps[0]
     if isinstance(ps, dict):
-        # try "price" and/or "valueAddedTaxIncluded" patterns
+        # "price" and/or "valueAddedTaxIncluded" patterns
         p2 = _to_float(ps.get("price"))
         if current_price is None:
             current_price = p2
@@ -295,18 +264,16 @@ def extract_price_fields(response, product_node: dict | None):
     Returns:
       current_price, base_price, discount_amount, discount_percent, price_text
     """
-    # 1) JSON-LD (best when present)
+    # JSON-LD 
     ld_current, ld_base, ld_disc_amt, ld_disc_pct, _ld_cur = extract_prices_from_ld(product_node)
 
-    # 2) HTML selectors (covers split prices + meta tags)
-    # Try meta/itemprop first (often survives hydration)
+    # HTML selectors (covers split prices + meta tags)
     meta_price = response.css('meta[itemprop="price"]::attr(content)').get()
     if not meta_price:
         meta_price = response.css('meta[property="product:price:amount"]::attr(content)').get()
     meta_price = clean(meta_price)
 
     # Common bol price containers / split pieces
-    # (don’t rely on exact classnames only; bol often splits whole & cents)
     price_text = (
         _first_text(response, [
             '[data-test="price"]::text',
@@ -345,14 +312,12 @@ def extract_price_fields(response, product_node: dict | None):
         ], limit=120)
     )
 
-    # 3) embedded JSON fallback (last resort, cheap regex search)
-    # Sometimes bol embeds price in script JSON even when DOM is minimal.
+    # embedded JSON fallback 
     embedded_current = None
     try:
         scripts = response.css("script::text").getall()
         if scripts:
             blob = " ".join(scripts[:12])  # keep it bounded
-            # try a couple of likely keys
             m = re.search(r'"price"\s*:\s*"?(?P<p>\d+(?:[.,]\d{1,2})?)"?', blob)
             if m:
                 embedded_current = price_to_float(m.group("p"))
@@ -456,11 +421,7 @@ def is_microphone_category_url(url: str) -> bool:
         return False
     return slug in ALLOWED_CATEGORY_KEYWORDS
 
-
-# -------------------------
-# STOCK parsing (ENHANCED)
-# -------------------------
-
+# STOCK parsing 
 def infer_in_stock(stock_text: str | None) -> bool | None:
     """
     More robust:
@@ -523,7 +484,7 @@ def extract_stock_fields(response, ld_availability: str | None):
     """
     in_stock_on_page = None
 
-    # 1) JSON-LD availability
+    # JSON-LD availability
     if ld_availability:
         low = ld_availability.lower()
         # schema.org/InStock, OutOfStock, PreOrder etc
@@ -532,8 +493,7 @@ def extract_stock_fields(response, ld_availability: str | None):
         elif "outofstock" in low:
             in_stock_on_page = False
 
-    # 2) Badge / visible stock status (like your screenshot "In stock")
-    # Try common badge-ish nodes first
+    # Badge / visible stock status 
     badge_text = clean(
         _first_text(response, [
             '[data-test*="stock"]::text',
@@ -551,7 +511,7 @@ def extract_stock_fields(response, ld_availability: str | None):
         ], limit=120)
     )
 
-    # 3) Delivery/buy-block text (your previous logic)
+    # Delivery/buy-block text 
     stock_bits = response.css('[data-test="delivery-info"] *::text').getall()
     if not stock_bits:
         stock_bits = response.css('[data-test="buy-block"] *::text').getall()
@@ -566,17 +526,10 @@ def extract_stock_fields(response, ld_availability: str | None):
     stock_status_text = stock_status_short(stock_text)
     stock_label = stock_yes_no_label(in_stock_on_page)
 
-    # If you want to always store the simple badge (YES/NO) visibly in stock_status_text too:
-    # (keeping your schema: stock_status_text is free text)
     # stock_status_text = stock_status_text or stock_label
-
     return in_stock_on_page, stock_status_text, stock_label
 
-
-# -------------------------
 # Product-level microphone filter helpers
-# -------------------------
-
 def is_actual_microphone(response, title_on_page: str | None) -> bool:
     """
     Conservative:
@@ -618,11 +571,7 @@ def is_actual_microphone(response, title_on_page: str | None) -> bool:
 
     return False
 
-
-# -------------------------
 # "blocked/shell" detection
-# -------------------------
-
 BLOCKED_MARKERS = [
     "this is a modal window",
     "beginning of dialog window",
@@ -649,11 +598,7 @@ def looks_like_shell_or_blocked_html(html: str | None) -> bool:
         return True
     return False
 
-
-# -------------------------
-# OPTIONAL selenium fallback renderer
-# -------------------------
-
+# selenium fallback renderer
 def selenium_enabled() -> bool:
     return str(os.getenv("USE_SELENIUM", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -672,7 +617,7 @@ def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
     from selenium.webdriver.support import expected_conditions as EC
     import time
 
-    # Prefer a local chromedriver if user provided it
+    # local chromedriver if user provided it
     chromedriver_path = os.getenv("CHROMEDRIVER")
     service = Service(chromedriver_path) if chromedriver_path else Service()
 
@@ -731,11 +676,7 @@ def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
     finally:
         driver.quit()
 
-
-# -------------------------
 # spider
-# -------------------------
-
 class BolProductsSpider(scrapy.Spider):
     name = "bol_products"
     allowed_domains = ["bol.com"]
@@ -778,8 +719,7 @@ class BolProductsSpider(scrapy.Spider):
         # proxy only when user actually configured proxy mode
         self.proxy_url = self._resolve_proxy_url() if self.bd_mode == "proxy" else None
 
-    # -------- Bright Data proxy (only used if bd_mode == "proxy") --------
-
+    # Bright Data proxy (only used if bd_mode == "proxy")
     def _resolve_proxy_url(self) -> str | None:
         p = os.getenv("BRIGHTDATA_PROXY")
         if p:
@@ -800,7 +740,7 @@ class BolProductsSpider(scrapy.Spider):
             m["proxy"] = self.proxy_url
         return m
 
-    # -------- selenium fallback wrapper --------
+    # selenium fallback wrapper
 
     def _listing_has_real_content(self, response) -> bool:
         # listing should have multiple product links
@@ -851,7 +791,7 @@ class BolProductsSpider(scrapy.Spider):
             self.logger.warning("Selenium render failed url=%s err=%s", response.url, exc)
             return response
 
-    # -------- ERD emitters --------
+    # ERD emitters
 
     def emit_scraperun(self):
         yield {
@@ -957,7 +897,7 @@ class BolProductsSpider(scrapy.Spider):
         price_text: str | None,
         in_stock: bool | None,
         stock_status_text: str | None,
-        stock_label: str | None,  # NEW (YES/NO)
+        stock_label: str | None,  
     ):
         yield {
             "type": "PRICESNAPSHOT",
@@ -973,7 +913,7 @@ class BolProductsSpider(scrapy.Spider):
             "price_text": clean(price_text),
             "in_stock": in_stock,
             "stock_status_text": clean(stock_status_text),
-            "stock_label": clean(stock_label),  # NEW FIELD (if your ERD allows it)
+            "stock_label": clean(stock_label),  
             "listing_key": listing_key,
             "scrape_run_key": self.scrape_run_key,
         }
@@ -1029,7 +969,7 @@ class BolProductsSpider(scrapy.Spider):
             "scrape_run_key": self.scrape_run_key,
         }
 
-    # -------- crawl entry --------
+    # crawl entry 
 
     def start_requests(self):
         if self.bd_mode == "disabled":
@@ -1057,8 +997,7 @@ class BolProductsSpider(scrapy.Spider):
             dont_filter=True,
         )
 
-    # -------- listing parsing --------
-
+    # listing parsing 
     def parse_listing(self, response):
         response = self.maybe_render(response, reason="listing")
 
@@ -1097,7 +1036,7 @@ class BolProductsSpider(scrapy.Spider):
             if page < 120:  # bump this if you want more pages
                 yield scrapy.Request(guessed, callback=self.parse_listing, meta=meta)
 
-    # -------- product parsing (STRICT mic-only) --------
+    # product parsing 
 
     def parse_product(self, response):
         response = self.maybe_render(response, reason="product")
@@ -1105,7 +1044,7 @@ class BolProductsSpider(scrapy.Spider):
         product_url = strip_tracking(response.url)
         seed_category_url = response.meta.get("seed_category_url") or self.seed_category_url
 
-        # breadcrumb category check (optional guard)
+        # breadcrumb category check 
         crumb_hrefs = response.css(
             'nav a[href]::attr(href), ol a[href]::attr(href), a[data-test*="breadcrumb"]::attr(href)'
         ).getall()
@@ -1114,7 +1053,7 @@ class BolProductsSpider(scrapy.Spider):
         if crumb_urls and not any(is_microphone_category_url(u) for u in crumb_urls):
             return
 
-        # ---- JSON-LD extraction (often best signal) ----
+        # JSON-LD extraction 
         ld_title = None
         ld_desc = None
         ld_brand = None
@@ -1204,14 +1143,14 @@ class BolProductsSpider(scrapy.Spider):
                 except Exception:
                     review_count_ld = None
 
-        # ---- HTML extraction ----
+        # HTML extraction 
         title_on_page = clean(
             response.css('h1[data-test="title"]::text').get()
             or response.css("h1::text").get()
             or ld_title
         )
 
-        # HARD FILTER: only keep actual microphones
+        # only keep actual microphones
         if not is_actual_microphone(response, title_on_page):
             return
 
@@ -1245,12 +1184,12 @@ class BolProductsSpider(scrapy.Spider):
         if image_url_on_page and image_url_on_page.startswith("//"):
             image_url_on_page = "https:" + image_url_on_page
 
-        # -------- PRICE (ENHANCED) --------
+        # PRICE 
         current_price, base_price, discount_amount, discount_percent, price_text = extract_price_fields(
             response, product_node
         )
 
-        # -------- STOCK (ENHANCED + YES/NO label) --------
+        # STOCK 
         in_stock_on_page, stock_status_text, stock_label = extract_stock_fields(response, ld_availability)
 
         # reviews aggregate
@@ -1285,7 +1224,7 @@ class BolProductsSpider(scrapy.Spider):
         gtin_on_page = clean(ld_gtin)
         model = clean(ld_model)
 
-        # fallbacks from body (ONLY if page looks real; avoid modal garbage)
+        # fallbacks from body 
         body_text = clean(" ".join(response.css("body *::text").getall())) or ""
         if body_text and any(m in body_text.lower() for m in ["modal window", "dialog window"]):
             body_text = ""
@@ -1312,14 +1251,14 @@ class BolProductsSpider(scrapy.Spider):
             or canonicalize(None, title_on_page, None)
         )
 
-        # -------- emit PRODUCT --------
+        # emit PRODUCT 
         product_key = None
         if canonical_name:
             product_key = stable_int_key(canonical_name)
             if product_key not in self._seen_product_key:
                 yield from self.emit_product(canonical_name=canonical_name, brand=brand, model=model)
 
-        # -------- emit PRODUCTLISTING --------
+        # emit PRODUCTLISTING 
         listing_key = stable_int_key(product_url)
         if listing_key not in self._seen_listing_key:
             yield from self.emit_productlisting(
@@ -1332,7 +1271,7 @@ class BolProductsSpider(scrapy.Spider):
                 category_id=None,
             )
 
-        # -------- emit PRICESNAPSHOT --------
+        # emit PRICESNAPSHOT 
         yield from self.emit_pricesnapshot(
             listing_key=listing_key,
             scraped_at=scraped_at,
@@ -1343,10 +1282,10 @@ class BolProductsSpider(scrapy.Spider):
             price_text=price_text,
             in_stock=in_stock_on_page,
             stock_status_text=stock_status_text,
-            stock_label=stock_label,  # YES/NO
+            stock_label=stock_label,  
         )
 
-        # -------- emit REVIEW aggregate placeholder --------
+        # emit REVIEW aggregate placeholder
         yield from self.emit_review_aggregate(
             listing_key=listing_key,
             created_at=scraped_at,
@@ -1356,7 +1295,7 @@ class BolProductsSpider(scrapy.Spider):
             review_url=product_url + "#ratings",
         )
 
-        # -------- emit PRODUCTMATCH --------
+        # emit PRODUCTMATCH 
         if product_key is not None:
             if gtin_on_page:
                 match_method = "gtin"
