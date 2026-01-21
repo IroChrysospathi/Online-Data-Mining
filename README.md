@@ -56,7 +56,9 @@ export USE_SELENIUM=1
 
 scrapy crawl bol_products -O ../../../data/raw/bol/bol_products.jsonl
 
-scrapy crawl bol_support -O ../../../data/raw/bol/bol_support.jsonl
+scrapy crawl bol_support \
+  -a input_file=../../../data/raw/bol/bol_products.jsonl \
+  -O ../../../data/raw/bol/bol_support.jsonl
 
 ### Thomann: 
 
