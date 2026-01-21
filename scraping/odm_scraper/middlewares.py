@@ -1,15 +1,11 @@
 """
 Scrapy middlewares.
 
-Responsibilities:
-- Optionally modify requests and responses
-- Handle headers, retries, or custom crawling behavior
-
 Bright Data integration:
 - Proxy middleware: sets request.meta["proxy"] using BRIGHTDATA_* env vars
 - Unlocker API middleware: fetches page via Bright Data Web Unlocker API
 
-IMPORTANT FIX:
+Notes:
 - Web Unlocker expects payload like: {"zone": "...", "url": "...", "format": "raw"}
 - Do NOT send "method" (can cause 400 Bad Request)
 """
@@ -17,7 +13,7 @@ IMPORTANT FIX:
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import requests
 from scrapy.http import HtmlResponse
@@ -45,55 +41,120 @@ class BrightDataProxyMiddleware:
 
     @classmethod
     def from_crawler(cls, crawler):
-        proxy_url = _build_proxy_url()
-        return cls(proxy_url)
+        return cls(_build_proxy_url())
 
     def process_request(self, request, spider):
-        if not self.proxy_url:
-            return None
-        request.meta["proxy"] = self.proxy_url
+        if self.proxy_url:
+            request.meta.setdefault("proxy", self.proxy_url)
         return None
 
 
 class BrightDataUnlockerAPIMiddleware:
-    def __init__(self, token: Optional[str], zone: Optional[str]):
+    """
+    Fetches the page via Bright Data Web Unlocker API and returns a Scrapy HtmlResponse.
+
+    Improvements vs your version:
+      - forwards request headers (User-Agent, Accept-Language, etc.)
+      - forces Accept-Encoding: identity (avoid weird encodings / variants)
+      - retries once on empty/blocked-ish html
+      - returns None on hard API errors so Scrapy retry/download can take over (if configured)
+    """
+
+    API_URL = "https://api.brightdata.com/request"
+
+    def __init__(self, token: Optional[str], zone: Optional[str], timeout: int = 60):
         self.token = token
         self.zone = zone
+        self.timeout = timeout
+        self.session = requests.Session()
 
     @classmethod
     def from_crawler(cls, crawler):
-        token = os.getenv("BRIGHTDATA_TOKEN")
-        zone = os.getenv("BRIGHTDATA_ZONE")
-        return cls(token, zone)
+        return cls(
+            os.getenv("BRIGHTDATA_TOKEN"),
+            os.getenv("BRIGHTDATA_ZONE"),
+            int(os.getenv("BRIGHTDATA_TIMEOUT", "60")),
+        )
+
+    def _request_headers_to_dict(self, scrapy_headers) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        try:
+            for k, v in scrapy_headers.items():
+                # scrapy headers are bytes
+                kk = k.decode("utf-8", errors="ignore") if isinstance(k, (bytes, bytearray)) else str(k)
+                if isinstance(v, (list, tuple)):
+                    vv = b",".join(v)
+                else:
+                    vv = v
+                vv = vv.decode("utf-8", errors="ignore") if isinstance(vv, (bytes, bytearray)) else str(vv)
+                out[kk] = vv
+        except Exception:
+            pass
+        return out
+
+    def _looks_bad_html(self, body: bytes | None) -> bool:
+        if not body:
+            return True
+        # very short html is often a block / placeholder
+        if len(body) < 800:
+            return True
+        low = body[:5000].lower()
+        needles = [
+            b"access denied",
+            b"captcha",
+            b"cloudflare",
+            b"datadome",
+            b"unusual traffic",
+            b"verify you are human",
+            b"attention required",
+            b"request blocked",
+        ]
+        return any(n in low for n in needles)
 
     def process_request(self, request, spider):
-        # If not configured, let Scrapy download normally (or proxy middleware handle it)
+        # Only activate if token+zone exist
         if not self.token or not self.zone:
             return None
 
-        # Match Bright Data's working example payload
-        payload = {
-            "zone": self.zone,
-            "url": request.url,
-            "format": "raw",  # recommended for Scrapy; returns the HTML bytes
-            # DO NOT include "method" here (can trigger 400 on Web Unlocker)
-        }
-
-        try:
-            resp = requests.post(
-                "https://api.brightdata.com/request",
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {self.token}",
-                    "Content-Type": "application/json",
-                },
-                timeout=60,
-            )
-        except Exception as exc:
-            spider.logger.warning("brightdata unlocker error url=%s err=%s", request.url, exc)
+        # Allow opting out per-request if you ever need it
+        if request.meta.get("skip_brightdata_unlocker"):
             return None
 
-        # If Bright Data returns an error, log the message body (super helpful for debugging)
+        # Forward request headers; force identity encoding
+        fwd_headers = self._request_headers_to_dict(request.headers)
+        fwd_headers["Accept-Encoding"] = "identity"
+
+        payload: Dict[str, Any] = {
+            "zone": self.zone,
+            "url": request.url,
+            "format": "raw",
+            "headers": fwd_headers,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+
+        def do_call() -> requests.Response | None:
+            try:
+                return self.session.post(
+                    self.API_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+            except Exception as exc:
+                spider.logger.warning(
+                    "BrightData unlocker error url=%s err=%s", request.url, exc
+                )
+                return None
+
+        resp = do_call()
+        if resp is None:
+            return None
+
+        # If BrightData itself errors, let Scrapy handle retries/fallback
         if resp.status_code >= 400:
             spider.logger.error(
                 "BrightData API error status=%s url=%s body=%s",
@@ -101,11 +162,24 @@ class BrightDataUnlockerAPIMiddleware:
                 request.url,
                 (resp.text or "")[:800],
             )
+            return None
+
+        body = resp.content or b""
+
+        # One retry if the HTML looks like a soft block / placeholder
+        if self._looks_bad_html(body) and not request.meta.get("_brightdata_unlocker_retried"):
+            request.meta["_brightdata_unlocker_retried"] = True
+            resp2 = do_call()
+            if resp2 is not None and resp2.status_code < 400 and resp2.content:
+                body = resp2.content
+
+        # Build Scrapy response
+        request.meta["brightdata_via_unlocker"] = True
 
         return HtmlResponse(
             url=request.url,
             status=resp.status_code,
-            body=resp.content,
+            body=body,
             encoding=resp.encoding or "utf-8",
             request=request,
         )
