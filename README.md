@@ -84,27 +84,18 @@ scrapy crawl maxiaxi_products -O ../../../data/raw/maxiaxi/maxiaxi_products.json
 
 
 # Database Tables
-### SCRAPERUN: Tracks each scraping execution.
 
-### COMPETITOR: Stores webshop information.
-
-### PAGELINK: Stores relevant URLs per competitor.
-
-### PRODUCT: Defines unique microphone products.
-
-### PRODUCTLISTING: Represents a product on a specific webshop.
-
-### PRICESNAPSHOT: Stores pricing data.
-
-### CUSTOMER_SERVICE: Stores customer service policies.
-
-### EXPERT_SUPPORT: Stores expert support features.
-
-### CATEGORY: Stores product categories.
-
-### PRODUCTMATCH: Links identical products across webshops.
-
-### REVIEW : Stores product reviews.
+- SCRAPERUN:Tracks each scraping execution.
+- COMPETITOR: Stores webshop information.
+- PAGELINK: Stores relevant URLs per competitor.
+- PRODUCT: Defines unique microphone products.
+- PRODUCTLISTING: Represents a product on a specific webshop.
+- PRICESNAPSHOT: Stores pricing data.
+- CUSTOMER_SERVICE: Stores customer service policies.
+- EXPERT_SUPPORT: Stores expert support features.
+- CATEGORY: Stores product categories.
+- PRODUCTMATCH: Links identical products across webshops.
+- REVIEW : Stores product reviews.
 
 ## Use of AI Tools
 AI tools were used only as supportive aids during the development of this project. They were applied for conceptual clarification, structuring ideas, and improving documentation clarity (e.g. phrasing research questions and explanations).
