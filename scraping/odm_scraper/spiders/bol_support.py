@@ -1,36 +1,50 @@
 """
-bol_support.py
+bol_support.py (UPDATED)
 
-Aligned to your bol_products schema:
-- JSONL/JSON file with lines like {"type":"product", ..., "source_url":"https://www.bol.com/.../<id>/"}
+- Bright Data proxy support (meta["proxy"])
+- Selenium fallback for consent/shell pages
+- Exports DB-aligned items:
+  - CUSTOMER_SERVICE -> columns match customer_service table
+  - EXPERT_SUPPORT   -> columns match expert_support table
 
-Exports:
-1) CUSTOMER_SERVICE (as before)  -> type="customer_service"
-2) EXPERT_SUPPORT (per listing) -> type="expert_support"
+Input:
+- Use your bol_products.jsonl as input_file to get product URLs.
 
-IMPORTANT:
-- CUSTOMER_SERVICE item contains ONLY the CUSTOMER_SERVICE columns specified.
-- EXPERT_SUPPORT item contains ONLY the EXPERT_SUPPORT columns required (plus listing_id for alignment).
+Output JSONL items:
+- type = "CUSTOMER_SERVICE"
+- type = "EXPERT_SUPPORT"
 
-JSON items will be exported.
+Linking:
+- Exports listing_key (stable int hash of product_url) so you can map to productlisting.listing_id.
 """
+
+from __future__ import annotations
 
 import csv
 import json
 import os
 import re
-import scrapy
+import hashlib
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
+import scrapy
+
+
+# -------------------------
 # Helpers
-def iso_utc_now():
+# -------------------------
+
+def iso_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def clean(text):
     if text is None:
         return None
     return re.sub(r"\s+", " ", str(text)).strip() or None
+
 
 def detect_int(x):
     try:
@@ -38,9 +52,6 @@ def detect_int(x):
     except Exception:
         return None
 
-def text_has_any(text, words):
-    t = (text or "").lower()
-    return any(w.lower() in t for w in words)
 
 def is_bol_domain(url: str) -> bool:
     if not url:
@@ -50,12 +61,13 @@ def is_bol_domain(url: str) -> bool:
     except Exception:
         return False
 
-def extract_listing_id_from_url(url: str):
-    # .../9300000184016836/  -> "9300000184016836"
-    if not url:
-        return None
-    m = re.search(r"/(\d{8,})/?(?:\?|#|$)", url)
-    return m.group(1) if m else None
+
+def stable_int_key(s: str, *, mod: int = 2_000_000_000) -> int:
+    if s is None:
+        s = ""
+    h = hashlib.sha1(s.encode("utf-8")).hexdigest()
+    return int(h[:12], 16) % mod
+
 
 def to_decimal_eur(s):
     if s is None:
@@ -70,54 +82,151 @@ def to_decimal_eur(s):
     except Exception:
         return None
 
-def extract_supportish_text(full_text: str, max_len: int = 4000) -> str | None:
+
+def text_has_any(text, words):
+    t = (text or "").lower()
+    return any(w.lower() in t for w in words)
+
+
+# -------------------------
+# Bright Data proxy handling
+# -------------------------
+
+def brightdata_proxy_url() -> str | None:
     """
-    Keep a compact snippet focused on support-related words.
-    This stays product-aligned (comes from the PDP itself), and is defensible for the assignment.
+    Supports either:
+      - BRIGHTDATA_PROXY="http://user:pass@host:port"
+    or:
+      - BRIGHTDATA_USERNAME / BRIGHTDATA_PASSWORD / BRIGHTDATA_HOST / BRIGHTDATA_PORT
     """
-    if not full_text:
-        return None
+    p = os.getenv("BRIGHTDATA_PROXY")
+    if p:
+        return p.strip()
 
-    # Grab sentences/chunks around support keywords (NL + EN)
-    keywords = [
-        "klantenservice", "contact", "help", "hulp",
-        "chat", "bel", "telefonisch", "telefoon",
-        "mail", "e-mail", "email", "bericht",
-        "retour", "retourneren", "bedenktijd",
-        "garantie", "verkoop door", "partner",
-    ]
-    t = full_text
-    tl = t.lower()
+    user = os.getenv("BRIGHTDATA_USERNAME")
+    pwd = os.getenv("BRIGHTDATA_PASSWORD")
+    host = os.getenv("BRIGHTDATA_HOST")
+    port = os.getenv("BRIGHTDATA_PORT")
 
-    hits = []
-    for kw in keywords:
-        idx = tl.find(kw)
-        if idx != -1:
-            start = max(0, idx - 220)
-            end = min(len(t), idx + 420)
-            hits.append(t[start:end])
+    if user and pwd and host and port:
+        return f"http://{user}:{pwd}@{host}:{port}"
 
-    if not hits:
-        return t[:max_len]
+    return None
 
-    snippet = " ... ".join(clean(h) for h in hits if h)
-    snippet = clean(snippet) or None
-    if snippet and len(snippet) > max_len:
-        snippet = snippet[:max_len]
-    return snippet
 
+# -------------------------
+# Selenium fallback
+# -------------------------
+
+BLOCKED_MARKERS = [
+    "this is a modal window",
+    "beginning of dialog window",
+    "cookie",
+    "toestemming",
+    "consent",
+    "accepteer",
+    "accept all",
+    "captcha",
+    "access denied",
+    "forbidden",
+    "robot",
+]
+
+
+def looks_like_shell_or_blocked_html(html: str | None) -> bool:
+    if not html:
+        return True
+    low = html.lower()
+    if any(m in low for m in BLOCKED_MARKERS):
+        return True
+    # very small HTML often indicates consent shell
+    if len(low) < 20_000:
+        return True
+    return False
+
+
+def selenium_enabled() -> bool:
+    return str(os.getenv("USE_SELENIUM", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
+    """
+    Render URL with Selenium and return page_source.
+    Tries to accept cookies.
+    """
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    import time
+
+    chromedriver_path = os.getenv("CHROMEDRIVER")
+    service = Service(chromedriver_path) if chromedriver_path else Service()
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--window-size=1365,900")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    )
+
+    driver = webdriver.Chrome(service=service, options=options)
+    try:
+        driver.get(url)
+        time.sleep(1.2)
+
+        for xpath in [
+            "//button[contains(translate(., 'AKKOORDACCEPT', 'akkoordaccept'), 'akkoord')]",
+            "//button[contains(translate(., 'AKKOORDACCEPT', 'akkoordaccept'), 'accept')]",
+            "//button[contains(translate(., 'ALLES', 'alles'), 'alles')]",
+        ]:
+            try:
+                btn = WebDriverWait(driver, 1.5).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+                btn.click()
+                time.sleep(0.6)
+                break
+            except Exception:
+                pass
+
+        wait = WebDriverWait(driver, max(2, int(wait_seconds)))
+        try:
+            wait.until(
+                lambda d: (
+                    len(d.find_elements(By.CSS_SELECTOR, "body")) > 0
+                    and (len(d.page_source) > 30_000)
+                )
+            )
+        except Exception:
+            pass
+
+        time.sleep(0.8)
+        return driver.page_source
+    finally:
+        driver.quit()
+
+
+# -------------------------
+# Spider
+# -------------------------
 
 class BolSupportSpider(scrapy.Spider):
     name = "bol_support"
     allowed_domains = ["bol.com"]
-
-    # Let callbacks receive 404s so we can fall back instead of spider ending with 0 items
     handle_httpstatus_list = [404]
 
     custom_settings = {
-        "ROBOTSTXT_OBEY": True,
-        "DOWNLOAD_DELAY": 1.5,
+        "ROBOTSTXT_OBEY": False,
+        "DOWNLOAD_TIMEOUT": 45,
+        "RETRY_TIMES": 2,
         "AUTOTHROTTLE_ENABLED": True,
+        "AUTOTHROTTLE_START_DELAY": 1.0,
+        "AUTOTHROTTLE_MAX_DELAY": 10.0,
         "CONCURRENT_REQUESTS": 2,
         "USER_AGENT": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -127,17 +236,23 @@ class BolSupportSpider(scrapy.Spider):
         "HTTPERROR_ALLOWED_CODES": [404],
     }
 
-    def __init__(self, input_file=None, competitor_id=None, *args, **kwargs):
+    def __init__(self, input_file=None, competitor_id=2, selenium_wait=6, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.input_file = input_file
-        self.competitor_id = detect_int(competitor_id) if competitor_id is not None else 1
+        self.competitor_id = detect_int(competitor_id) if competitor_id is not None else 2
 
-        # Defaults (bol typically 30 days)
+        try:
+            self.selenium_wait = int(selenium_wait)
+        except Exception:
+            self.selenium_wait = 6
+
+        self.proxy_url = brightdata_proxy_url()
+
+        # Defaults (best-effort assumptions)
         self.global_free_shipping_threshold_amt = None
         self.global_cooling_off_days = 30
 
-        # Support URLs change often; we try a few and if all fail, we still proceed.
         self.support_seed_urls = [
             "https://www.bol.com/nl/nl/klantenservice/",
             "https://www.bol.com/nl/nl/klantenservice/contact/",
@@ -146,18 +261,18 @@ class BolSupportSpider(scrapy.Spider):
         ]
 
         self.product_rows = self._load_products(self.input_file)
-        self.logger.info(f"Loaded {len(self.product_rows)} product URLs from input_file={self.input_file}")
+        self.logger.info("Loaded %s product URLs from input_file=%s", len(self.product_rows), self.input_file)
 
-    # Input loading (erd schema)
+    # ----- input loading -----
+
     def _load_products(self, path):
         rows = []
-
         if not path:
             self.logger.error("Missing -a input_file=... (required)")
             return rows
 
         if not os.path.exists(path):
-            self.logger.error(f"input_file not found: {path}")
+            self.logger.error("input_file not found: %s", path)
             return rows
 
         ext = os.path.splitext(path)[1].lower()
@@ -166,40 +281,34 @@ class BolSupportSpider(scrapy.Spider):
             if not isinstance(obj, dict):
                 return
 
-            # If type exists, keep only products
-            if "type" in obj and obj.get("type") != "product":
+            # accept productlisting items from your bol_products.jsonl
+            t = obj.get("type")
+            if t and t not in {"PRODUCTLISTING"}:
                 return
 
-            url = obj.get("source_url") or obj.get("url") or obj.get("product_url")
+            url = obj.get("product_url")
             if not url or not is_bol_domain(url):
                 return
 
-            listing_id = obj.get("listing_id") or extract_listing_id_from_url(url)
-            if not listing_id:
-                return
-
-            rows.append({"listing_id": str(listing_id), "url": url})
+            url = url.strip()
+            rows.append({"url": url, "listing_key": stable_int_key(url)})
 
         if ext in [".jsonl", ".json"]:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = f.read().strip()
-
+            raw = Path(path).read_text(encoding="utf-8").strip()
             if not raw:
                 return rows
 
-            # JSON array
-            if raw[0] == "[":
+            if raw.startswith("["):
                 try:
                     data = json.loads(raw)
                 except Exception as e:
-                    self.logger.error(f"Failed to parse JSON array: {e}")
+                    self.logger.error("Failed to parse JSON array: %s", e)
                     return rows
                 if isinstance(data, list):
                     for obj in data:
                         add_row(obj)
                 return rows
 
-            # JSONL
             for line in raw.splitlines():
                 line = line.strip()
                 if not line:
@@ -218,37 +327,63 @@ class BolSupportSpider(scrapy.Spider):
                     add_row(obj)
             return rows
 
-        self.logger.error(f"Unsupported input_file extension: {ext}")
+        self.logger.error("Unsupported input_file extension: %s", ext)
         return rows
 
-    # Crawl
+    # ----- helpers -----
+
+    def _base_meta(self):
+        m = {}
+        if self.proxy_url:
+            m["proxy"] = self.proxy_url
+        return m
+
+    def maybe_render(self, response):
+        if not selenium_enabled():
+            return response
+
+        html = response.text or ""
+        if not looks_like_shell_or_blocked_html(html):
+            return response
+
+        self.logger.warning("Selenium fallback: %s", response.url)
+        try:
+            html2 = render_with_selenium(response.url, wait_seconds=self.selenium_wait)
+            from scrapy.http import HtmlResponse
+            return HtmlResponse(url=response.url, body=html2, encoding="utf-8", request=response.request)
+        except Exception as exc:
+            self.logger.warning("Selenium render failed url=%s err=%s", response.url, exc)
+            return response
+
+    # ----- crawl -----
+
     def start_requests(self):
         if not self.product_rows:
-            self.logger.error("No products loaded. Check input_file (type=product and source_url).")
+            self.logger.error("No product URLs loaded. Use -a input_file=... with PRODUCTLISTING lines.")
             return
 
+        meta = self._base_meta()
+
+        # first try to parse global defaults from support pages, then schedule products
         yield scrapy.Request(
             self.support_seed_urls[0],
             callback=self.parse_support_then_schedule,
-            meta={"support_index": 0},
+            meta={**meta, "support_index": 0},
             dont_filter=True,
         )
 
     def parse_support_then_schedule(self, response):
-        """
-        Try to parse global defaults from support pages.
-        If this page is 404, try next. If all fail, schedule products anyway.
-        """
+        response = self.maybe_render(response)
         idx = response.meta.get("support_index", 0)
 
         if response.status == 404:
-            self.logger.warning(f"Support URL 404: {response.url}")
+            self.logger.warning("Support URL 404: %s", response.url)
             next_idx = idx + 1
             if next_idx < len(self.support_seed_urls):
                 yield scrapy.Request(
                     self.support_seed_urls[next_idx],
                     callback=self.parse_support_then_schedule,
-                    meta={"support_index": next_idx},
+                    meta={**self._base_meta(), "support_index": next_idx},
                     dont_filter=True,
                 )
                 return
@@ -256,7 +391,6 @@ class BolSupportSpider(scrapy.Spider):
         else:
             full_text = clean(" ".join(response.css("body *::text").getall())) or ""
 
-            # free shipping threshold (best-effort)
             m = re.search(
                 r"gratis\s+verzending.{0,80}?vanaf\s*€\s*([0-9]+(?:[.,][0-9]{1,2})?)",
                 full_text,
@@ -265,29 +399,34 @@ class BolSupportSpider(scrapy.Spider):
             if m:
                 self.global_free_shipping_threshold_amt = to_decimal_eur(m.group(1))
 
-            # cooling off days (best-effort)
             m = re.search(r"(\d+)\s*dagen\s*bedenktijd", full_text, re.IGNORECASE)
             if m:
                 v = detect_int(m.group(1))
                 if v:
                     self.global_cooling_off_days = v
 
-        # IMPORTANT: schedule products no matter what
+        meta = self._base_meta()
         for row in self.product_rows:
             yield scrapy.Request(
                 row["url"],
                 callback=self.parse_product,
-                meta={"listing_id": row["listing_id"]},
+                meta={**meta, "listing_key": row["listing_key"], "product_url": row["url"]},
+                dont_filter=True,
             )
 
-    # Product page parsing -> CUSTOMER_SERVICE + EXPERT_SUPPORT
     def parse_product(self, response):
-        listing_id = response.meta.get("listing_id")
+        response = self.maybe_render(response)
+
         scraped_at = iso_utc_now()
+        product_url = response.meta.get("product_url") or response.url
+        listing_key = response.meta.get("listing_key") or stable_int_key(product_url)
 
         full_text = clean(" ".join(response.css("body *::text").getall())) or ""
 
-        # CUSTOMER_SERVICE fields
+        # -------------------------
+        # CUSTOMER_SERVICE (DB columns)
+        # -------------------------
+
         shipping_included = None
         if text_has_any(full_text, ["gratis verzending", "gratis bezorging", "gratis geleverd"]):
             shipping_included = True
@@ -296,17 +435,9 @@ class BolSupportSpider(scrapy.Spider):
 
         free_shipping_threshold_amt = self.global_free_shipping_threshold_amt
 
-        pickup_point_available = None
-        if text_has_any(full_text, ["afhaalpunt", "ophaalpunt", "afhalen", "pickup point", "pick-up point"]):
-            pickup_point_available = True
-
-        delivery_shipping_available = None
-        if text_has_any(full_text, ["bezorgen", "bezorgd", "geleverd", "levertijd", "thuisbezorgd", "morgen in huis"]):
-            delivery_shipping_available = True
-
-        delivery_courier_available = None
-        if text_has_any(full_text, ["postnl", "dhl", "dpd", "ups", "gls", "bezorger", "koerier"]):
-            delivery_courier_available = True
+        pickup_point_available = True if text_has_any(full_text, ["afhaalpunt", "ophaalpunt", "afhalen", "pickup point", "pick-up point"]) else None
+        delivery_shipping_available = True if text_has_any(full_text, ["bezorgen", "bezorgd", "geleverd", "levertijd", "thuisbezorgd", "morgen in huis"]) else None
+        delivery_courier_available = True if text_has_any(full_text, ["postnl", "dhl", "dpd", "ups", "gls", "bezorger", "koerier"]) else None
 
         cooling_off_days = None
         m = re.search(r"(\d+)\s*dagen\s*bedenktijd", full_text, re.IGNORECASE)
@@ -315,20 +446,16 @@ class BolSupportSpider(scrapy.Spider):
         if cooling_off_days is None:
             cooling_off_days = self.global_cooling_off_days
 
-        free_returns = None
-        if text_has_any(full_text, ["gratis retourneren", "gratis retour", "kosteloos retourneren", "gratis terugsturen"]):
-            free_returns = True
+        free_returns = True if text_has_any(full_text, ["gratis retourneren", "gratis retour", "kosteloos retourneren", "gratis terugsturen"]) else None
 
         warranty_provider = None
         m = re.search(r"verkoop\s+door\s+([^\|\n\r]+)", full_text, re.IGNORECASE)
-        seller_text = None
-        if m:
-            seller_text = clean(m.group(1))
-            if seller_text:
-                if "bol.com" in seller_text.lower() or seller_text.lower().strip() in ["bol", "bolcom"]:
-                    warranty_provider = "bol.com"
-                else:
-                    warranty_provider = seller_text
+        seller_text = clean(m.group(1)) if m else None
+        if seller_text:
+            if "bol.com" in seller_text.lower() or seller_text.lower().strip() in {"bol", "bolcom"}:
+                warranty_provider = "bol.com"
+            else:
+                warranty_provider = seller_text
 
         warranty_duration_months = None
         m = re.search(r"(\d+)\s*(jaar|jaren)\s*garantie", full_text, re.IGNORECASE)
@@ -342,8 +469,7 @@ class BolSupportSpider(scrapy.Spider):
                 warranty_duration_months = detect_int(m.group(1))
 
         customer_service_url = None
-        hrefs = response.css("a::attr(href)").getall()
-        for h in hrefs:
+        for h in response.css("a::attr(href)").getall():
             if not h:
                 continue
             u = response.urljoin(h)
@@ -356,11 +482,10 @@ class BolSupportSpider(scrapy.Spider):
         if customer_service_url is None:
             customer_service_url = "https://www.bol.com/nl/nl/klantenservice/"
 
-        # Emit CUSTOMER_SERVICE item (ONLY erd columns)
         yield {
-            "type": "customer_service",
+            "type": "CUSTOMER_SERVICE",
             "competitor_id": self.competitor_id,
-            "listing_id": listing_id,
+            "listing_id": None,            # resolved during DB import using listing_key
             "scraped_at": scraped_at,
             "shipping_included": shipping_included,
             "free_shipping_threshold_amt": free_shipping_threshold_amt,
@@ -372,58 +497,50 @@ class BolSupportSpider(scrapy.Spider):
             "warranty_provider": warranty_provider,
             "warranty_duration_months": warranty_duration_months,
             "customer_service_url": customer_service_url,
+            "listing_key": listing_key,     # helper for joining to productlisting
+            "product_url": product_url,     # helper (optional)
         }
 
-        # EXPERT_SUPPORT fields (product-aligned heuristic) 
-        # We derive from the PDP itself (seller responsibility + contact/help wording).
-        # in_store_support_available: bol has no stores
-        in_store_support_available = False
+        # -------------------------
+        # EXPERT_SUPPORT (DB columns)
+        # -------------------------
 
-        # If sold by bol, users typically can chat with bol CS; partner listings are often redirected.
         sold_by_bol = False
         if seller_text:
-            sold_by_bol = ("bol.com" in seller_text.lower()) or (seller_text.lower().strip() in ["bol", "bolcom"])
+            sold_by_bol = ("bol.com" in seller_text.lower()) or (seller_text.lower().strip() in {"bol", "bolcom"})
 
-        # chat_available:
-        # - TRUE if explicitly mentions chat/help AND sold by bol
-        # - FALSE if clearly partner and no chat mention
-        # - else None
         mentions_chat = text_has_any(full_text, ["chat", "livechat", "chatten", "chat met"])
-        chat_available = None
+        expert_chat_available = None
         if sold_by_bol and (mentions_chat or text_has_any(full_text, ["klantenservice", "hulp", "contact"])):
-            chat_available = True
+            expert_chat_available = True
         elif (not sold_by_bol) and mentions_chat:
-            # sometimes bol still offers chat entry; keep True if we see it
-            chat_available = True
+            expert_chat_available = True
 
-        # phone_support_available:
-        # bol rarely shows phone numbers publicly; only set True if explicit.
-        phone_support_available = None
-        if re.search(r"\b(\+31|0)\s?\d{1,3}[\s\-]?\d{3,4}[\s\-]?\d{3,4}\b", full_text) or text_has_any(full_text, ["bel ons", "telefonisch", "telefoon"]):
-            phone_support_available = True
+        phone_support_available = True if (
+            re.search(r"\b(\+31|0)\s?\d{1,3}[\s\-]?\d{3,4}[\s\-]?\d{3,4}\b", full_text)
+            or text_has_any(full_text, ["bel ons", "telefonisch", "telefoon"])
+        ) else None
 
-        # email_support_available:
-        # bol uses forms; treat as available if page mentions contact/message.
         email_support_available = None
         if text_has_any(full_text, ["stuur een bericht", "stuur ons een bericht", "contactformulier", "e-mail", "email", "mail ons"]):
             email_support_available = True
         elif sold_by_bol and text_has_any(full_text, ["klantenservice", "contact"]):
-            # If sold by bol and there is a general contact/help section, assume message-based support.
             email_support_available = True
 
-        # expert_support_text: PDP snippet around support keywords
-        expert_support_text = extract_supportish_text(full_text, max_len=4000)
+        in_store_support = False  # bol has no stores
 
-        # Emit EXPERT_SUPPORT item (ONLY required fields + listing_id for alignment)
+        # Keep a compact support snippet
+        expert_support_text = clean(full_text[:4000])
+
         yield {
-            "type": "expert_support",
-            "listing_id": listing_id,
+            "type": "EXPERT_SUPPORT",
+            "competitor_id": self.competitor_id,
             "scraped_at": scraped_at,
-            "chat_available": chat_available,
+            "source_url": product_url,
+            "expert_chat_available": expert_chat_available,
             "phone_support_available": phone_support_available,
             "email_support_available": email_support_available,
-            "in_store_support_available": in_store_support_available,
+            "in_store_support": in_store_support,
             "expert_support_text": expert_support_text,
+            "listing_key": listing_key,   # helper for joining to productlisting
         }
-
-

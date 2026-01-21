@@ -1,3 +1,0 @@
-[
-{"type": "run", "scrape_run_id": "1d624264-7c98-4b34-a4da-50cfae273b9d", "started_at": "2026-01-20T23:30:06.285462+00:00", "git_commit_hash": "ef05d2423d0b675ea9066d1bf6e6499ace93feb6", "crawler_version": "bol_products/RAW-2.6-input-jsonl-and-pagination", "notes": "bol crawl (category fallback OR bax-item search input)", "brightdata_mode": "unlocker_api", "bax_json_path": "data/raw/bol/input.json", "max_titles": 2000}
-]
