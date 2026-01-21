@@ -27,7 +27,7 @@ Each team member is responsible for specific components of the project:
 
 - Vanna Pušić: Thomann products spider 
 
-- Iro Chrysospathi: Bol products spider 
+- Iro Chrysospathi: Bol products/support spider 
 
 ## Execution 
 Instructions for spider execution: 
@@ -36,7 +36,7 @@ Instructions for spider execution:
 
 Path: /Online-Data-Mining/scraping/odm_scraper/spiders
 
-export BRIGHTDATA_TOKEN="<API key>"
+export BRIGHTDATA_TOKEN="API key"
 
 export BRIGHTDATA_ZONE="Name"
 
@@ -48,7 +48,7 @@ scrapy crawl bax_products -O ../../../data/raw/bax/bax_products.json
 
 Path: /Online-Data-Mining/scraping/odm_scraper/spiders
 
-export BRIGHTDATA_TOKEN="<API key>"
+export BRIGHTDATA_TOKEN="API key"
 
 export BRIGHTDATA_ZONE="Name"
 
@@ -64,7 +64,7 @@ scrapy crawl bol_support \
 
 Path: /Online-Data-Mining/scraping/odm_scraper/spiders
 
-export BRIGHTDATA_TOKEN="<API key>"
+export BRIGHTDATA_TOKEN="API key"
 
 export BRIGHTDATA_ZONE="Name"
 
@@ -76,7 +76,7 @@ scrapy crawl thomann_products -O ../../../data/raw/thomann/thomann_products.json
 
 Path: /Online-Data-Mining/scraping/odm_scraper/spiders
 
-export BRIGHTDATA_TOKEN="<API key>"
+export BRIGHTDATA_TOKEN="API key"
 
 export BRIGHTDATA_ZONE="Name"
 
