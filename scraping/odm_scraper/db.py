@@ -9,8 +9,8 @@ from typing import Optional
 COMPETITORS = [
     (1, "Bax-shop", "NL", "https://www.bax-shop.nl"),
     (2, "bol.com", "NL", "https://www.bol.com"),
-    (3, "Thomann", "DE", "https://www.thomann.nl"),
-    (4, "MaxiAxi", "NL", "https://www.maxiaxi.com"),
+    (3, "MaxiAxi", "NL", "https://www.maxiaxi.com"),
+    (4, "Thomann", "DE", "https://www.thomann.nl")
 ]
 
 
