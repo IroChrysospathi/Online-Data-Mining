@@ -1,10 +1,15 @@
+# /scraping/odm_scraper/spiders/maxiaxi_products.py
 # =========================
-# MaxiAxi Microfoons Scraper (DB schema aligned)
-# Writes to existing repo SQLite DB (db/odm.sqlite) + JSONL output
-# Blocked-page detection + debug HTML dump
-# NO CSV output
-# Dual export: repo + desktop
+# MaxiAxi Microfoons Scraper (compact + project-ready)
+# - Bright Data support (Unlocker API OR Proxy)
+# - Selenium fallback renderer (optional)
+# - Blocked-page detection + debug HTML dump
+# - JSONL output (dual export: repo + desktop)
+# - Optional SQLite pipeline (repo db/odm.sqlite) aligned to your schema
+# - Pure Python (no terminal/subprocess usage)
 # =========================
+
+from __future__ import annotations
 
 import json
 import os
@@ -12,12 +17,26 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
-import pandas as pd
 import scrapy
-from scrapy.crawler import CrawlerProcess
+from scrapy.http import HtmlResponse
 
+# =========================
+# Bright Data credentials (SET IN PYTHON)
+# =========================
+os.environ["BRIGHTDATA_PROXY"] = (
+    "http://brd-customer-hl_53943da9-zone-scraping_browser1:"
+    "p5zj9yfl8jes@brd.superproxy.io:9222"
+)
+
+# Optional: keep these too (not strictly required if BRIGHTDATA_PROXY is set)
+os.environ["BRIGHTDATA_USERNAME"] = "brd-customer-hl_53943da9-zone-scraping_browser1"
+os.environ["BRIGHTDATA_PASSWORD"] = "p5zj9yfl8jes"
+os.environ["BRIGHTDATA_HOST"] = "brd.superproxy.io"
+os.environ["BRIGHTDATA_PORT"] = "9222"
+os.environ["BRIGHTDATA_ZONE"] = "scraping_browser1"
 
 # =========================
 # 1) CONFIG
@@ -28,12 +47,14 @@ RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 CONFIG = {
     "run_id": RUN_ID,
     "currency": "EUR",
-    "max_pages_per_category": 20,
-    "download_delay_s": 1.25,
-    "concurrent_requests": 4,
-    "user_agent": "AUAS-ODM-Scraper/1.0 (educational use)",
-    "timeout_s": 25,
-    "debug_dump": str(os.getenv("DEBUG_DUMP", "1")).strip() not in {"0", "false", "False", "no", "NO"},
+    "max_pages_per_category": int(os.getenv("MAX_PAGES", "20")),
+    "download_delay_s": float(os.getenv("DOWNLOAD_DELAY", "1.25")),
+    "concurrent_requests": int(os.getenv("CONCURRENT_REQUESTS", "4")),
+    "timeout_s": int(os.getenv("DOWNLOAD_TIMEOUT", "75")),
+    "user_agent": os.getenv("USER_AGENT", "AUAS-ODM-Scraper/1.0 (educational use)"),
+    "debug_dump": str(os.getenv("DEBUG_DUMP", "1")).strip().lower() not in {"0", "false", "no"},
+    "use_selenium": str(os.getenv("USE_SELENIUM", "0")).strip().lower() in {"1", "true", "yes", "y", "on"},
+    "selenium_wait_s": int(os.getenv("SELENIUM_WAIT", "6")),
 }
 
 MAXIAXI_MICROFOONS_URL = (
@@ -55,9 +76,8 @@ RETAILERS = {
     }
 }
 
-
 # =========================
-# 2) DATABASE (CONNECT TO EXISTING REPO DB)
+# 2) PATHS (repo root, DB, outputs) — dual export
 # =========================
 
 def get_repo_root() -> Path:
@@ -65,14 +85,16 @@ def get_repo_root() -> Path:
     if gh:
         return Path(gh).resolve()
 
-    # Notebook / interactive fallback
-    if "__file__" not in globals():
-        return Path.cwd().resolve()
-
-    p = Path(__file__).resolve()
-    if p.parent.name.lower() == "scraping":
-        return p.parent.parent
-    return p.parent
+    # Scrapy project layout: .../scraping/odm_scraper/spiders/maxiaxi_products.py
+    if "__file__" in globals():
+        p = Path(__file__).resolve()
+        # climb: spiders -> odm_scraper -> scraping -> repo root
+        for _ in range(6):
+            if (p / "data").exists() or (p / "db").exists():
+                return p
+            p = p.parent
+        return Path(__file__).resolve().parents[3]  # best-effort
+    return Path.cwd().resolve()
 
 
 def get_db_path() -> Path:
@@ -84,6 +106,291 @@ def get_db_path() -> Path:
 
 DB_PATH = get_db_path()
 
+# Desktop target
+DESKTOP_OUT_DIR = Path("~/Desktop/Assignment/Onlune-Data-Mining/data/raw/maxiaxi").expanduser()
+# Repo target
+REPO_OUT_DIR = (get_repo_root() / "data" / "raw" / "maxiaxi").resolve()
+# Optional override for primary output dir
+PRIMARY_OUT_DIR = Path(os.getenv("OUTPUT_DIR", str(REPO_OUT_DIR))).expanduser().resolve()
+
+EXPORT_DIRS: list[Path] = []
+for d in [PRIMARY_OUT_DIR, REPO_OUT_DIR, DESKTOP_OUT_DIR]:
+    d = d.expanduser().resolve()
+    if d not in EXPORT_DIRS:
+        EXPORT_DIRS.append(d)
+
+for d in EXPORT_DIRS:
+    d.mkdir(parents=True, exist_ok=True)
+
+OUT_DIR = PRIMARY_OUT_DIR
+DEBUG_DIR = OUT_DIR / "debug"
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+JSONL_NAME = f"maxiaxi_items_{RUN_ID}.jsonl"
+JSONL_PATH = OUT_DIR / JSONL_NAME
+
+
+# =========================
+# 3) HELPERS
+# =========================
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def clean_text(x: Any) -> str | None:
+    if x is None:
+        return None
+    s = re.sub(r"\s+", " ", str(x)).strip()
+    return s or None
+
+
+def strip_tracking(url: str) -> str:
+    if not url:
+        return url
+    try:
+        p = urlparse(url)
+        q = parse_qs(p.query)
+        drop_keys = {
+            "gclid", "gbraid", "wbraid", "fbclid",
+            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+            "_gl", "_ga", "_gid", "mc_cid", "mc_eid",
+            "ref", "cid", "source",
+        }
+        for k in list(q.keys()):
+            if k.lower() in drop_keys:
+                q.pop(k, None)
+        new_query = urlencode(q, doseq=True)
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+    except Exception:
+        return url
+
+
+def looks_blocked_title(title: str | None) -> bool:
+    if not title:
+        return False
+    t = title.lower()
+    needles = [
+        "toestemming", "consent", "cookie",
+        "verify", "verific", "access denied", "blocked",
+        "captcha", "robot", "attention required",
+    ]
+    return any(n in t for n in needles)
+
+
+def is_blocked_response(response: scrapy.http.Response) -> bool:
+    title = clean_text(response.css("title::text").get())
+    if response.status in (403, 429, 503):
+        return True
+    if looks_blocked_title(title):
+        return True
+    # tiny HTML often indicates shell/consent
+    if response.text and len(response.text) < 20_000:
+        low = response.text.lower()
+        if any(x in low for x in ["cookie", "toestemming", "consent", "captcha", "access denied"]):
+            return True
+    return False
+
+
+def copy_file_to_dirs(src: Path, dirs: list[Path]) -> list[Path]:
+    written: list[Path] = []
+    if not src.exists():
+        return written
+    import shutil
+    for d in dirs:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            dst = d / src.name
+            if dst.resolve() == src.resolve():
+                written.append(dst)
+                continue
+            shutil.copy2(src, dst)
+            written.append(dst)
+        except Exception:
+            pass
+    return written
+
+
+def brightdata_mode() -> str:
+    # Unlocker API has priority when token+zone exist
+    if os.getenv("BRIGHTDATA_TOKEN") and os.getenv("BRIGHTDATA_ZONE"):
+        return "unlocker_api"
+    # Proxy mode if proxy or username/password exist
+    if os.getenv("BRIGHTDATA_PROXY") or (os.getenv("BRIGHTDATA_USERNAME") and os.getenv("BRIGHTDATA_PASSWORD")):
+        return "proxy"
+    return "disabled"
+
+
+def resolve_brightdata_proxy_url() -> str | None:
+    p = os.getenv("BRIGHTDATA_PROXY")
+    if p:
+        return p.strip()
+
+    user = os.getenv("BRIGHTDATA_USERNAME")
+    pwd = os.getenv("BRIGHTDATA_PASSWORD")
+    host = os.getenv("BRIGHTDATA_HOST")
+    port = os.getenv("BRIGHTDATA_PORT")
+    if user and pwd and host and port:
+        return f"http://{user}:{pwd}@{host}:{port}"
+    return None
+
+
+# =========================
+# 4) Selenium renderer (optional)
+# =========================
+
+def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
+    """
+    Minimal Selenium renderer:
+    - headless Chrome
+    - attempts cookie/consent click
+    - returns page_source
+    """
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    import time
+
+    chromedriver_path = os.getenv("CHROMEDRIVER")
+    service = Service(chromedriver_path) if chromedriver_path else Service()
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--window-size=1365,900")
+    options.add_argument(f"--user-agent={CONFIG['user_agent']}")
+
+    driver = webdriver.Chrome(service=service, options=options)
+    try:
+        driver.get(url)
+        time.sleep(1.2)
+
+        # Best-effort cookie acceptance (Dutch/English variants)
+        for xpath in [
+            "//button[contains(translate(., 'AKKOORDACCEPT', 'akkoordaccept'), 'akkoord')]",
+            "//button[contains(translate(., 'AKKOORDACCEPT', 'akkoordaccept'), 'accept')]",
+            "//button[contains(translate(., 'ALLES', 'alles'), 'alles')]",
+            "//button[contains(translate(., 'TOESTEMMING', 'toestemming'), 'toestemming')]",
+        ]:
+            try:
+                btn = WebDriverWait(driver, 1.5).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+                btn.click()
+                time.sleep(0.6)
+                break
+            except Exception:
+                pass
+
+        # Wait for likely content markers (listing or PDP)
+        wait = WebDriverWait(driver, max(2, int(wait_seconds)))
+        try:
+            wait.until(
+                lambda d: (
+                    len(d.find_elements(By.CSS_SELECTOR, "ol.products li.product-item")) > 0
+                    or len(d.find_elements(By.CSS_SELECTOR, "h1.page-title")) > 0
+                    or len(d.find_elements(By.CSS_SELECTOR, "script[type='application/ld+json']")) > 0
+                )
+            )
+        except Exception:
+            pass
+
+        time.sleep(0.8)
+        return driver.page_source
+    finally:
+        driver.quit()
+
+
+# =========================
+# 5) Bright Data Unlocker (Python-only) middleware
+# =========================
+class GlobalProxyMiddleware:
+    """
+    Ensures proxy is applied to every request unless already set.
+    This prevents some requests going direct (a common cause of blocks/timeouts).
+    """
+    def process_request(self, request, spider):
+        proxy_url = getattr(spider, "proxy_url", None)
+        if proxy_url and not request.meta.get("proxy"):
+            request.meta["proxy"] = proxy_url
+        return None
+
+
+class BrightDataUnlockerMiddleware:
+    """
+    If BRIGHTDATA_TOKEN + BRIGHTDATA_ZONE are set, fetch pages via Bright Data Unlocker API in Python,
+    and return HtmlResponse to Scrapy.
+    """
+    def __init__(self, token: str, zone: str):
+        self.token = token
+        self.zone = zone
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        token = os.getenv("BRIGHTDATA_TOKEN", "").strip()
+        zone = os.getenv("BRIGHTDATA_ZONE", "").strip()
+        return cls(token=token, zone=zone)
+
+    def process_request(self, request: scrapy.Request, spider):
+        if not self.token or not self.zone:
+            return None
+        if request.meta.get("skip_brightdata"):
+            return None
+
+        url = request.url
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return None
+
+        try:
+            import requests
+        except Exception:
+            spider.logger.warning("requests not installed; Bright Data Unlocker API disabled.")
+            return None
+
+        endpoint = os.getenv("BRIGHTDATA_UNLOCKER_ENDPOINT", "https://api.brightdata.com/request").strip()
+        timeout = int(os.getenv("BRIGHTDATA_TIMEOUT", "60"))
+
+        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        payload = {"zone": self.zone, "url": url, "format": "raw"}
+
+        try:
+            r = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+            body = r.content or b""
+            return HtmlResponse(url=url, status=r.status_code, body=body, encoding="utf-8", request=request)
+        except Exception as exc:
+            spider.logger.warning("Bright Data Unlocker API failed url=%s err=%s", url, exc)
+            return None
+
+# =========================
+# 6) Items
+# =========================
+
+class PageRawItem(scrapy.Item):
+    competitor_key = scrapy.Field()
+    url = scrapy.Field()
+
+
+class ProductListingItem(scrapy.Item):
+    competitor_key = scrapy.Field()
+    category_name = scrapy.Field()
+
+    product_url = scrapy.Field()
+    product_name = scrapy.Field()
+    ean = scrapy.Field()
+    sku = scrapy.Field()
+    image_url_on_pdp = scrapy.Field()
+
+    description_clean = scrapy.Field()
+    brand = scrapy.Field()
+    model = scrapy.Field()
+
+
+# =========================
+# 7) Optional SQLite pipeline (schema-aligned)
+# =========================
 
 def db_connect(path: Path) -> sqlite3.Connection:
     if not path.exists():
@@ -139,29 +446,13 @@ def ensure_competitor(con: sqlite3.Connection, retailer_key: str) -> int:
     return int(con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
 
 
-def ensure_category_row(
-    con: sqlite3.Connection,
-    competitor_id: int,
-    name: str,
-    url: str | None,
-    parent_category_id: int | None = None,
-) -> int:
-    """
-    category schema:
-      category_id PK
-      competitor_id NOT NULL
-      name
-      url
-      parent_category_id
-    """
+def ensure_category_row(con: sqlite3.Connection, competitor_id: int, name: str, url: str | None, parent_category_id: int | None) -> int:
     if not name:
         raise ValueError("Category.name is required.")
-
     row = con.execute(
         "SELECT category_id FROM category WHERE competitor_id = ? AND name = ?",
         (competitor_id, name),
     ).fetchone()
-
     if row:
         cat_id = int(row["category_id"])
         con.execute(
@@ -179,193 +470,25 @@ def ensure_category_row(
     return int(con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
 
 
-# =========================
-# 3) OUTPUT PATHS (JSON + DEBUG)  — dual export: repo + desktop
-# =========================
-
-# Desktop target (your original location)
-DESKTOP_OUT_DIR = Path("~/Desktop/Assignment/Onlune-Data-Mining/data/raw/maxiaxi").expanduser()
-
-# Repo target
-REPO_OUT_DIR = (get_repo_root() / "data" / "raw" / "maxiaxi").resolve()
-
-# Optional override for primary output dir
-PRIMARY_OUT_DIR = Path(os.getenv("OUTPUT_DIR", str(REPO_OUT_DIR))).expanduser().resolve()
-
-# All export destinations (deduped, ordered)
-EXPORT_DIRS: list[Path] = []
-for d in [PRIMARY_OUT_DIR, REPO_OUT_DIR, DESKTOP_OUT_DIR]:
-    d = d.expanduser().resolve()
-    if d not in EXPORT_DIRS:
-        EXPORT_DIRS.append(d)
-
-for d in EXPORT_DIRS:
-    d.mkdir(parents=True, exist_ok=True)
-
-# Primary dir is used during crawling (debug dumps go here)
-OUT_DIR = PRIMARY_OUT_DIR
-
-DEBUG_DIR = OUT_DIR / "debug"
-DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-
-JSONL_NAME = f"maxiaxi_items_{RUN_ID}.jsonl"
-DB_EXPORT_JSON_NAME = f"odm_db_export_{RUN_ID}.json"
-
-JSONL_PATH = OUT_DIR / JSONL_NAME
-DB_EXPORT_JSON_PATH = OUT_DIR / DB_EXPORT_JSON_NAME
-
-
-# =========================
-# 4) HELPERS
-# =========================
-
-def clean_text(x):
-    if x is None:
-        return None
-    s = re.sub(r"\s+", " ", str(x)).strip()
-    return s or None
-
-
-def strip_tracking(url: str) -> str:
-    if not url:
-        return url
-    try:
-        p = urlparse(url)
-        q = parse_qs(p.query)
-
-        drop_keys = {
-            "gclid", "gbraid", "wbraid", "fbclid",
-            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-            "_gl", "_ga", "_gid", "mc_cid", "mc_eid",
-            "ref", "cid", "source",
-        }
-
-        for k in list(q.keys()):
-            if k.lower() in drop_keys:
-                q.pop(k, None)
-
-        new_query = urlencode(q, doseq=True)
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
-    except Exception:
-        return url
-
-
-def looks_blocked_title(title: str | None) -> bool:
-    if not title:
-        return False
-    t = title.lower()
-    needles = [
-        "toestemming", "consent", "cookie",
-        "verify", "verific", "access denied", "blocked",
-        "captcha", "robot", "attention required",
-    ]
-    return any(n in t for n in needles)
-
-
-def is_blocked_response(response: scrapy.http.Response) -> bool:
-    title = clean_text(response.css("title::text").get())
-    if response.status in (403, 429, 503):
-        return True
-    if looks_blocked_title(title):
-        return True
-    return False
-
-
-def copy_file_to_dirs(src: Path, dirs: list[Path]) -> list[Path]:
-    """
-    Copy src file into each directory in dirs, keeping filename.
-    Returns list of written destination paths.
-    """
-    written: list[Path] = []
-    if not src.exists():
-        return written
-
-    import shutil
-
-    for d in dirs:
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-            dst = d / src.name
-
-            # Avoid copying onto itself
-            if dst.resolve() == src.resolve():
-                written.append(dst)
-                continue
-
-            shutil.copy2(src, dst)
-            written.append(dst)
-        except Exception:
-            # Keep scraping resilient; best-effort copies
-            pass
-
-    return written
-
-
-# =========================
-# 5) SCRAPY ITEMS
-# =========================
-
-class CategoryItem(scrapy.Item):
-    competitor_key = scrapy.Field()
-    name = scrapy.Field()
-    url = scrapy.Field()
-    parent_category_id = scrapy.Field()
-
-
-class ProductListingItem(scrapy.Item):
-    competitor_key = scrapy.Field()
-    category_name = scrapy.Field()
-
-    product_url = scrapy.Field()             # maps to productlisting.product_url
-    product_name = scrapy.Field()            # maps to productlisting.product_name
-    ean = scrapy.Field()                     # maps to productlisting.ean
-    sku = scrapy.Field()                     # maps to productlisting.sku
-    image_url_on_pdp = scrapy.Field()        # maps to productlisting.image_url_on_pdp
-
-    # extras for JSONL only
-    description_clean = scrapy.Field()
-    brand = scrapy.Field()
-    model = scrapy.Field()
-
-
-class PageRawItem(scrapy.Item):
-    competitor_key = scrapy.Field()
-    url = scrapy.Field()
-
-
-# =========================
-# 6) PIPELINES (DB + JSONL OUTPUT)
-# =========================
-
 class SQLitePipeline:
     """
-    DB schema alignment (your schema):
-
-    productlisting(listing_id PK, competitor_id, category_id, product_url, product_name, ean, sku, image_url_on_pdp)
-    product(product_id PK, listing_id FK, canonical_name, model)
-    pageraw(page_id PK, competitor_id, url)
+    Writes to your existing repo DB schema:
+      productlisting(listing_id PK, competitor_id, category_id, product_url, product_name, ean, sku, image_url_on_pdp)
+      product(product_id PK, listing_id FK NOT NULL, canonical_name, model)
+      pageraw(page_id PK, competitor_id, url)
     """
 
     def open_spider(self, spider):
         self.con = db_connect(DB_PATH)
         self.cur = self.con.cursor()
-
         self.competitor_key = "maxiaxi"
         self.competitor_id = ensure_competitor(self.con, self.competitor_key)
 
-        # Table presence
         self.has_pageraw = table_exists(self.con, "pageraw")
         self.has_product = table_exists(self.con, "product")
         self.has_productlisting = table_exists(self.con, "productlisting")
-
-        # Column caches
         self.productlisting_cols = get_table_columns(self.con, "productlisting") if self.has_productlisting else set()
         self.product_cols = get_table_columns(self.con, "product") if self.has_product else set()
-
-        spider.logger.info("DB detected: pageraw=%s product=%s productlisting=%s",
-                           self.has_pageraw, self.has_product, self.has_productlisting)
-        spider.logger.info("DB columns: productlisting=%s", sorted(list(self.productlisting_cols)))
-        spider.logger.info("DB columns: product=%s", sorted(list(self.product_cols)))
 
         seed_url = RETAILERS[self.competitor_key]["category_seeds"]["microphones"]
         self.default_category_id = ensure_category_row(
@@ -376,13 +499,16 @@ class SQLitePipeline:
             parent_category_id=None,
         )
 
+        spider.logger.info(
+            "DB detected: productlisting=%s product=%s pageraw=%s",
+            self.has_productlisting, self.has_product, self.has_pageraw
+        )
+
     def close_spider(self, spider):
-        con = getattr(self, "con", None)
-        if con is not None:
-            try:
-                con.commit()
-            finally:
-                con.close()
+        try:
+            self.con.commit()
+        finally:
+            self.con.close()
 
     def _insert_pageraw(self, url: str) -> None:
         if not self.has_pageraw or not url:
@@ -396,9 +522,6 @@ class SQLitePipeline:
             pass
 
     def _upsert_productlisting(self, category_id: int, d: dict) -> int:
-        """
-        Upsert into productlisting using ONLY your schema columns.
-        """
         if not self.has_productlisting:
             raise sqlite3.OperationalError("DB missing required table: productlisting")
 
@@ -406,7 +529,6 @@ class SQLitePipeline:
         if not product_url:
             raise ValueError("product_url is required for productlisting.")
 
-        # Map scraped fields -> DB columns
         candidate = {
             "competitor_id": self.competitor_id,
             "category_id": category_id,
@@ -416,7 +538,6 @@ class SQLitePipeline:
             "sku": d.get("sku"),
             "image_url_on_pdp": d.get("image_url_on_pdp"),
         }
-
         data = {k: v for k, v in candidate.items() if k in self.productlisting_cols}
 
         row = self.cur.execute(
@@ -429,34 +550,20 @@ class SQLitePipeline:
             up_fields = {k: v for k, v in data.items() if k not in {"competitor_id", "product_url"} and v is not None}
             if up_fields:
                 sets = ", ".join([f"{k} = COALESCE(?, {k})" for k in up_fields.keys()])
-                sql = f"UPDATE productlisting SET {sets} WHERE listing_id = ?"
-                self.cur.execute(sql, (*up_fields.values(), listing_id))
+                self.cur.execute(f"UPDATE productlisting SET {sets} WHERE listing_id = ?", (*up_fields.values(), listing_id))
             return listing_id
 
         cols = list(data.keys())
         vals = [data[c] for c in cols]
         placeholders = ", ".join(["?"] * len(cols))
-        sql = f"INSERT INTO productlisting ({', '.join(cols)}) VALUES ({placeholders})"
-        self.cur.execute(sql, vals)
+        self.cur.execute(f"INSERT INTO productlisting ({', '.join(cols)}) VALUES ({placeholders})", vals)
         return int(self.cur.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
 
-    def _upsert_product_row(self, listing_id: int, canonical_name: str | None, model: str | None) -> None:
-        """
-        product schema:
-          product_id PK
-          listing_id FK NOT NULL
-          canonical_name
-          model
-        In your DB, product is per listing, so we update/insert by listing_id.
-        """
+    def _upsert_product(self, listing_id: int, canonical_name: str | None, model: str | None) -> None:
         if not self.has_product:
             return
 
-        row = self.cur.execute(
-            "SELECT product_id FROM product WHERE listing_id = ?",
-            (listing_id,),
-        ).fetchone()
-
+        row = self.cur.execute("SELECT product_id FROM product WHERE listing_id = ?", (listing_id,)).fetchone()
         if row:
             pid = int(row["product_id"])
             self.cur.execute(
@@ -478,45 +585,30 @@ class SQLitePipeline:
     def process_item(self, item, spider):
         d = dict(item)
 
-        if isinstance(item, CategoryItem):
-            ensure_category_row(
-                self.con,
-                competitor_id=self.competitor_id,
-                name=d.get("name"),
-                url=d.get("url"),
-                parent_category_id=d.get("parent_category_id"),
-            )
-            self.con.commit()
-            return item
-
         if isinstance(item, PageRawItem):
-            if self.has_pageraw:
-                self._insert_pageraw(d.get("url"))
-                self.con.commit()
+            self._insert_pageraw(d.get("url"))
+            self.con.commit()
             return item
 
         if isinstance(item, ProductListingItem):
             category_id = self.default_category_id
             listing_id = self._upsert_productlisting(category_id, d)
 
-            # Build canonical name for product table row
             brand = clean_text(d.get("brand"))
             model = clean_text(d.get("model"))
             product_name = clean_text(d.get("product_name"))
+            canonical_name = f"{brand} {model}" if (brand and model) else product_name
 
-            if brand and model:
-                canonical_name = f"{brand} {model}"
-            else:
-                canonical_name = product_name
-
-            # Upsert product row linked to listing_id
-            self._upsert_product_row(listing_id, canonical_name=canonical_name, model=model)
-
+            self._upsert_product(listing_id, canonical_name=canonical_name, model=model)
             self.con.commit()
             return item
 
         return item
 
+
+# =========================
+# 8) JSONL pipeline (dual export)
+# =========================
 
 class JSONLPipeline:
     def open_spider(self, spider):
@@ -525,15 +617,17 @@ class JSONLPipeline:
         run_record = {
             "type": "run",
             "run_id": RUN_ID,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": utc_now_iso(),
             "spider": spider.name,
-            "seed": MAXIAXI_MICROFOONS_URL,
+            "seed": strip_tracking(MAXIAXI_MICROFOONS_URL),
             "repo_root": str(get_repo_root()),
             "db_path": str(DB_PATH),
             "db_exists": DB_PATH.exists(),
             "output_dir_primary": str(OUT_DIR),
             "output_dirs_all": [str(d) for d in EXPORT_DIRS],
             "debug_dump": CONFIG["debug_dump"],
+            "brightdata_mode": spider.bd_mode,
+            "use_selenium": CONFIG["use_selenium"],
             "config": {
                 "max_pages_per_category": CONFIG["max_pages_per_category"],
                 "download_delay_s": CONFIG["download_delay_s"],
@@ -559,24 +653,14 @@ class JSONLPipeline:
                 print("-", p)
 
     def process_item(self, item, spider):
-        now = datetime.now(timezone.utc).isoformat()
-        t = "item"
-        if isinstance(item, ProductListingItem):
-            t = "productlisting"
-        elif isinstance(item, CategoryItem):
-            t = "category"
-        elif isinstance(item, PageRawItem):
-            t = "pageraw"
-
-        rec = {"type": t, "scraped_at": now, **dict(item)}
+        rec = {"type": "item", "scraped_at": utc_now_iso(), **dict(item)}
         self.f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return item
 
 
 # =========================
-# 7) SPIDER (BLOCKED DETECTION + DEBUG DUMP)
+# 9) Spider
 # =========================
-
 class CompetitorBenchmarkSpider(scrapy.Spider):
     name = "maxiaxi_microfoons"
     allowed_domains = ["www.maxiaxi.com", "maxiaxi.com"]
@@ -586,14 +670,52 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         "DOWNLOAD_DELAY": CONFIG["download_delay_s"],
         "CONCURRENT_REQUESTS": CONFIG["concurrent_requests"],
         "LOG_LEVEL": "INFO",
-        "DOWNLOAD_TIMEOUT": CONFIG["timeout_s"],
-        "ROBOTSTXT_OBEY": True,
+
+        # IMPORTANT: 25s is too low behind proxy. Make 75 the default.
+        "DOWNLOAD_TIMEOUT": int(os.getenv("DOWNLOAD_TIMEOUT", "75")),
+        "RETRY_TIMES": int(os.getenv("RETRY_TIMES", "3")),
+        "RETRY_HTTP_CODES": [403, 408, 429, 500, 502, 503, 504],
+
+        "AUTOTHROTTLE_ENABLED": True,
+        "AUTOTHROTTLE_START_DELAY": 1.0,
+        "AUTOTHROTTLE_MAX_DELAY": 10.0,
+
+        "ROBOTSTXT_OBEY": False,
+
+        # Middlewares: Unlocker (if configured) + proxy force + Scrapy proxy middleware
+        "DOWNLOADER_MIDDLEWARES": {
+            f"{__name__}.BrightDataUnlockerMiddleware": 35,   # only active when token+zone set
+            f"{__name__}.GlobalProxyMiddleware": 40,
+            "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 110,
+        },
+
         "ITEM_PIPELINES": {
-            "__main__.JSONLPipeline": 400,
-            # If you want DB writes too, enable this:
-            # "__main__.SQLitePipeline": 300,
+            f"{__name__}.JSONLPipeline": 400,
+            # Enable DB if you want:
+            # f"{__name__}.SQLitePipeline": 300,
         },
     }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.bd_mode = brightdata_mode()
+        self.proxy_url = resolve_brightdata_proxy_url()
+
+        # Hard requirement: must have Unlocker OR Proxy configured
+        if self.bd_mode == "disabled":
+            raise RuntimeError(
+                "Bright Data is required. Configure either:\n"
+                "  - BRIGHTDATA_TOKEN + BRIGHTDATA_ZONE (Unlocker API), or\n"
+                "  - BRIGHTDATA_PROXY (or BRIGHTDATA_USERNAME/BRIGHTDATA_PASSWORD + BRIGHTDATA_HOST + BRIGHTDATA_PORT)"
+            )
+
+        # In proxy mode we require proxy_url (since we force proxy)
+        if self.bd_mode == "proxy" and not self.proxy_url:
+            raise RuntimeError(
+                "Bright Data proxy mode detected but no proxy URL resolved.\n"
+                "Set BRIGHTDATA_PROXY OR BRIGHTDATA_USERNAME/PASSWORD/HOST/PORT."
+            )
 
     def _dump_response(self, response, label: str):
         if not CONFIG["debug_dump"]:
@@ -605,23 +727,54 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         except Exception as exc:
             self.logger.warning("Could not save debug HTML err=%s", exc)
 
+    def errback_aux(self, failure):
+        req = failure.request
+        self.logger.warning("AUX page failed (ignored): %s err=%s", req.url, repr(failure.value))
+
+    # ---------- Selenium fallback ----------
+    def maybe_render(self, response, reason: str) -> scrapy.http.Response:
+        if not CONFIG["use_selenium"]:
+            return response
+
+        # If blocked OR looks like shell, attempt render
+        if is_blocked_response(response):
+            self.logger.warning("Selenium fallback (%s) due to blocked/shell: %s", reason, response.url)
+            try:
+                html = render_with_selenium(response.url, wait_seconds=CONFIG["selenium_wait_s"])
+                return HtmlResponse(
+                    url=response.url,
+                    body=html.encode("utf-8", errors="ignore"),
+                    encoding="utf-8",
+                    request=response.request,
+                )
+            except Exception as exc:
+                self.logger.warning("Selenium render failed url=%s err=%s", response.url, exc)
+                return response
+
+        return response
+
+    # ---------- Crawl ----------
     def start_requests(self):
         r_key = "maxiaxi"
         r = RETAILERS[r_key]
 
-        # Store raw policy/support pages in pageraw (since no pagelink table exists)
-        for _, url in (r.get("policy_urls") or {}).items():
+        # policy/support (best effort)
+        for url in (r.get("policy_urls") or {}).values():
             yield scrapy.Request(
                 url=strip_tracking(url),
                 callback=self.parse_raw_page,
                 meta={"retailer_key": r_key},
+                dont_filter=True,
+                errback=self.errback_aux,
             )
 
-        for _, url in (r.get("expert_support_urls") or {}).items():
+        for url in (r.get("expert_support_urls") or {}).values():
             yield scrapy.Request(
                 url=strip_tracking(url),
                 callback=self.parse_raw_page,
                 meta={"retailer_key": r_key},
+                dont_filter=True,
+                errback=self.errback_aux,
             )
 
         seed = r["category_seeds"]["microphones"]
@@ -629,9 +782,11 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
             url=strip_tracking(seed),
             callback=self.parse_listing,
             meta={"retailer_key": r_key, "category_key": "microphones", "page_no": 1},
+            dont_filter=True,
         )
 
     def parse_raw_page(self, response):
+        response = self.maybe_render(response, reason="raw")
         title = clean_text(response.css("title::text").get())
         self.logger.info("RAW_PAGE status=%s url=%s title=%s", response.status, response.url, title)
 
@@ -645,7 +800,9 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         )
 
     def parse_listing(self, response):
+        response = self.maybe_render(response, reason="listing")
         page_no = response.meta.get("page_no", 1)
+
         title = clean_text(response.css("title::text").get())
         self.logger.info("LISTING page=%s status=%s url=%s title=%s", page_no, response.status, response.url, title)
 
@@ -700,6 +857,8 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
                 )
 
     def parse_product(self, response):
+        response = self.maybe_render(response, reason="product")
+
         title = clean_text(response.css("title::text").get())
         self.logger.info("PRODUCT status=%s url=%s title=%s", response.status, response.url, title)
 
@@ -755,67 +914,28 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
             brand=brand,
             model=model,
         )
-
-
+        
 # =========================
-# 8) RUN + OPTIONAL DB EXPORT (JSON)
+# 10) RUN (script mode)
 # =========================
+
+from scrapy.crawler import CrawlerProcess
 
 def run_scrape():
+    print("Starting MaxiAxi spider (script mode). Run:", RUN_ID)
+    print("Primary output:", JSONL_PATH)
+    print("All export dirs:", [str(d) for d in EXPORT_DIRS])
+    print("DB path:", DB_PATH, "exists:", DB_PATH.exists())
+    print("BrightData mode:", brightdata_mode())
+    print("Proxy URL set:", bool(resolve_brightdata_proxy_url()))
+    print("Use selenium:", CONFIG["use_selenium"], "wait:", CONFIG["selenium_wait_s"])
+    print("Timeout:", int(os.getenv("DOWNLOAD_TIMEOUT", "75")))
+
     process = CrawlerProcess(settings={})
     process.crawl(CompetitorBenchmarkSpider)
     process.start()
 
-    print("\nScrape finished.")
-    print("Primary JSONL:", JSONL_PATH)
-    print("DB:", DB_PATH)
-    print("Debug dir:", DEBUG_DIR)
-    print("All export dirs:")
-    for d in EXPORT_DIRS:
-        print("-", d)
-
-    # Optional DB export to JSON
-    if DB_PATH.exists():
-        export = {}
-        with db_connect(DB_PATH) as con:
-            for table in [
-                "competitor", "category", "productlisting", "product",
-                "pricesnapshot", "scanresult", "expert_support",
-                "customer_service", "review", "pageraw", "productvendor"
-            ]:
-                if not table_exists(con, table):
-                    continue
-                try:
-                    df = pd.read_sql_query(f"SELECT * FROM {table}", con)
-                    export[table] = df.to_dict(orient="records")
-                except Exception as e:
-                    export[table] = {"_error": str(e)}
-
-        DB_EXPORT_JSON_PATH.write_text(json.dumps(export, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        copies = copy_file_to_dirs(DB_EXPORT_JSON_PATH, EXPORT_DIRS)
-
-        print("DB export JSON saved to (primary):", DB_EXPORT_JSON_PATH)
-        if copies:
-            print("DB export JSON also copied to:")
-            for p in copies:
-                print("-", p)
-    else:
-        print("Skipped DB export because DB file does not exist:", DB_PATH)
-
+    print("Scrape finished. JSONL:", JSONL_PATH)
 
 if __name__ == "__main__":
-    print("Setup OK. Timestamp:", datetime.now(timezone.utc).isoformat())
-    print("Config loaded. Retailers:", list(RETAILERS.keys()), "Run:", RUN_ID)
-    print("Seed:", MAXIAXI_MICROFOONS_URL)
-
-    print("Repo root:", get_repo_root())
-    print("Resolved DB:", DB_PATH)
-    print("DB exists:", DB_PATH.exists())
-
-    print("Primary output dir:", OUT_DIR)
-    print("All export dirs:")
-    for d in EXPORT_DIRS:
-        print("-", d)
-
     run_scrape()
