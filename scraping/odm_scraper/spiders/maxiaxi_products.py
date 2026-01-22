@@ -1,7 +1,6 @@
-# =========================
-# MaxiAxi Microfoons Scraper
-# =========================
-
+# ======================
+# MaxiAxi Products Scraper
+# ======================
 from __future__ import annotations
 
 import json
@@ -11,24 +10,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import scrapy
 from scrapy.http import HtmlResponse
-
-# Bright Data credentials 
-
-# Use Unlocker API 
-os.environ["BRIGHTDATA_TOKEN"] = "454a358a-9a98-4861-abe9-6d5f996fd79c"
-os.environ["BRIGHTDATA_ZONE"] = "scraping_browser1"
-
-# IMPORTANT: disable proxy mode so Scrapy does NOT tunnel via :9222
-os.environ.pop("BRIGHTDATA_PROXY", None)
-
-os.environ["BRIGHTDATA_USERNAME"] = "brd-customer-hl_53943da9-zone-scraping_browser1"
-os.environ["BRIGHTDATA_PASSWORD"] = "p5zj9yfl8jes"
-os.environ["BRIGHTDATA_HOST"] = "brd.superproxy.io"
-os.environ["BRIGHTDATA_PORT"] = "9222"
 
 # 1) CONFIG
 
@@ -45,6 +30,7 @@ CONFIG = {
     "debug_dump": str(os.getenv("DEBUG_DUMP", "1")).strip().lower() not in {"0", "false", "no"},
     "use_selenium": str(os.getenv("USE_SELENIUM", "1")).strip().lower() in {"1", "true", "yes", "y", "on"},
     "selenium_wait_s": int(os.getenv("SELENIUM_WAIT", "6")),
+    "write_db": str(os.getenv("WRITE_DB", "0")).strip().lower() in {"1", "true", "yes", "y", "on"},
 }
 
 MAXIAXI_MICROFOONS_URL = (
@@ -65,23 +51,23 @@ RETAILERS = {
         "category_seeds": {"microphones": MAXIAXI_MICROFOONS_URL},
     }
 }
-# 2) PATHS 
+
+# 2) PATHS
 
 def get_repo_root() -> Path:
     gh = os.getenv("GITHUB_WORKSPACE")
     if gh:
         return Path(gh).resolve()
 
-    # Scrapy project layout:
     if "__file__" in globals():
-        p = Path(__file__).resolve()
-        # climb
-        for _ in range(6):
-            if (p / "data").exists() or (p / "db").exists():
+        p = Path(__file__).resolve().parent
+        for _ in range(8):
+            if (p / "data").exists() or (p / "db").exists() or (p / "scraping").exists():
                 return p
             p = p.parent
-        return Path(__file__).resolve().parents[3]  
+        return Path(__file__).resolve().parents[2]
     return Path.cwd().resolve()
+
 
 def get_db_path() -> Path:
     env = os.getenv("DB_PATH")
@@ -89,9 +75,10 @@ def get_db_path() -> Path:
         return Path(env).expanduser().resolve()
     return (get_repo_root() / "db" / "odm.sqlite").resolve()
 
+
 DB_PATH = get_db_path()
 
-# Desktop target
+# Desktop target (your original path kept as-is, including the "Onlune" spelling)
 DESKTOP_OUT_DIR = Path("~/Desktop/Assignment/Onlune-Data-Mining/data/raw/maxiaxi").expanduser()
 # Repo target
 REPO_OUT_DIR = (get_repo_root() / "data" / "raw" / "maxiaxi").resolve()
@@ -119,11 +106,13 @@ JSONL_PATH = OUT_DIR / JSONL_NAME
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
 def clean_text(x: Any) -> str | None:
     if x is None:
         return None
     s = re.sub(r"\s+", " ", str(x)).strip()
     return s or None
+
 
 def strip_tracking(url: str) -> str:
     if not url:
@@ -145,6 +134,7 @@ def strip_tracking(url: str) -> str:
     except Exception:
         return url
 
+
 def looks_blocked_title(title: str | None) -> bool:
     if not title:
         return False
@@ -156,39 +146,37 @@ def looks_blocked_title(title: str | None) -> bool:
     ]
     return any(n in t for n in needles)
 
+
 def is_blocked_response(response: scrapy.http.Response) -> bool:
     """
     Treat responses as "blocked/useless" when they are:
     - explicit block statuses (403/429/503)
     - consent/captcha/etc detected
-    - or when BrightData returns a tiny HTML shell
+    - or when the HTML is suspiciously small/empty
     """
     title = clean_text(response.css("title::text").get())
 
-    # explicit block statuses
     if response.status in (403, 429, 503):
         return True
 
-    # title-based block signals
     if looks_blocked_title(title):
         return True
 
     body_len = len(response.body or b"")
-
     if body_len < 5_000:
         return True
 
-    # Missing title
     if title is None and body_len < 20_000:
         return True
 
-    # consent/captcha keywords in smaller HTML pages
     if response.text and len(response.text) < 80_000:
         low = response.text.lower()
         if any(x in low for x in ["cookie", "toestemming", "consent", "captcha", "access denied"]):
             return True
 
     return False
+
+
 def copy_file_to_dirs(src: Path, dirs: list[Path]) -> list[Path]:
     written: list[Path] = []
     if not src.exists():
@@ -207,14 +195,18 @@ def copy_file_to_dirs(src: Path, dirs: list[Path]) -> list[Path]:
             pass
     return written
 
+
 def brightdata_mode() -> str:
-    # Unlocker API 
+    # Unlocker API
     if os.getenv("BRIGHTDATA_TOKEN") and os.getenv("BRIGHTDATA_ZONE"):
         return "unlocker_api"
-    # Proxy mode if proxy or username/password exist
-    if os.getenv("BRIGHTDATA_PROXY") or (os.getenv("BRIGHTDATA_USERNAME") and os.getenv("BRIGHTDATA_PASSWORD")):
+    # Proxy mode
+    if os.getenv("BRIGHTDATA_PROXY") or (
+        os.getenv("BRIGHTDATA_USERNAME") and os.getenv("BRIGHTDATA_PASSWORD") and os.getenv("BRIGHTDATA_HOST") and os.getenv("BRIGHTDATA_PORT")
+    ):
         return "proxy"
     return "disabled"
+
 
 def resolve_brightdata_proxy_url() -> str | None:
     p = os.getenv("BRIGHTDATA_PROXY")
@@ -229,7 +221,7 @@ def resolve_brightdata_proxy_url() -> str | None:
         return f"http://{user}:{pwd}@{host}:{port}"
     return None
 
-# 4) Selenium renderer 
+# 4) Selenium renderer
 
 def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
     """
@@ -277,7 +269,6 @@ def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
             except Exception:
                 pass
 
-        # Wait for likely content markers (listing or PDP)
         wait = WebDriverWait(driver, max(2, int(wait_seconds)))
         try:
             wait.until(
@@ -295,18 +286,7 @@ def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
     finally:
         driver.quit()
 
-# 5) Bright Data Unlocker 
-
-class GlobalProxyMiddleware:
-    """
-    Ensures proxy is applied to every request unless already set.
-    This prevents some requests going direct (a common cause of blocks/timeouts).
-    """
-    def process_request(self, request, spider):
-        proxy_url = getattr(spider, "proxy_url", None)
-        if proxy_url and not request.meta.get("proxy"):
-            request.meta["proxy"] = proxy_url
-        return None
+# 5) Bright Data middlewares
 
 class BrightDataUnlockerMiddleware:
     """
@@ -353,11 +333,33 @@ class BrightDataUnlockerMiddleware:
             spider.logger.warning("Bright Data Unlocker API failed url=%s err=%s", url, exc)
             return None
 
+
+class GlobalProxyMiddleware:
+    """
+    Force Bright Data proxy on EVERY request (unless already set).
+    Automatically disabled when BrightData Unlocker API is active.
+    """
+    def process_request(self, request, spider):
+        if getattr(spider, "bd_mode", None) == "unlocker_api":
+            return None
+
+        proxy_url = getattr(spider, "proxy_url", None)
+        if proxy_url and not request.meta.get("proxy"):
+            request.meta["proxy"] = proxy_url
+
+            cnt = getattr(spider, "_proxy_applied_count", 0)
+            if cnt < 8:
+                spider.logger.info("Proxy applied -> %s | %s", proxy_url, request.url)
+            spider._proxy_applied_count = cnt + 1
+
+        return None
+
 # 6) Items
 
 class PageRawItem(scrapy.Item):
     competitor_key = scrapy.Field()
     url = scrapy.Field()
+
 
 class ProductListingItem(scrapy.Item):
     competitor_key = scrapy.Field()
@@ -373,18 +375,14 @@ class ProductListingItem(scrapy.Item):
     brand = scrapy.Field()
     model = scrapy.Field()
 
-# 7) Optional SQLite pipeline 
+# 7) SQLite pipeline 
 
 def db_connect(path: Path) -> sqlite3.Connection:
-    if not path.exists():
-        raise FileNotFoundError(
-            f"SQLite DB not found: {path}\n"
-            "Expected: <repo>/db/odm.sqlite or set DB_PATH env var."
-        )
     con = sqlite3.connect(str(path))
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON;")
     return con
+
 
 def table_exists(con: sqlite3.Connection, table: str) -> bool:
     row = con.execute(
@@ -392,6 +390,7 @@ def table_exists(con: sqlite3.Connection, table: str) -> bool:
         (table,),
     ).fetchone()
     return row is not None
+
 
 def get_table_columns(con: sqlite3.Connection, table: str) -> set[str]:
     cols = set()
@@ -401,6 +400,7 @@ def get_table_columns(con: sqlite3.Connection, table: str) -> set[str]:
     except sqlite3.Error:
         pass
     return cols
+
 
 def ensure_competitor(con: sqlite3.Connection, retailer_key: str) -> int:
     r = RETAILERS[retailer_key]
@@ -450,13 +450,16 @@ def ensure_category_row(con: sqlite3.Connection, competitor_id: int, name: str, 
 
 class SQLitePipeline:
     """
-    Writes to your existing repo DB schema:
-      productlisting(listing_id PK, competitor_id, category_id, product_url, product_name, ean, sku, image_url_on_pdp)
-      product(product_id PK, listing_id FK NOT NULL, canonical_name, model)
-      pageraw(page_id PK, competitor_id, url)
+    Writes to your existing repo DB schema (if present).
+    Enabled only if WRITE_DB=1 and DB exists.
     """
 
     def open_spider(self, spider):
+        self.enabled = bool(CONFIG["write_db"]) and DB_PATH.exists()
+        if not self.enabled:
+            spider.logger.info("SQLitePipeline disabled (WRITE_DB=%s, db_exists=%s).", CONFIG["write_db"], DB_PATH.exists())
+            return
+
         self.con = db_connect(DB_PATH)
         self.cur = self.con.cursor()
         self.competitor_key = "maxiaxi"
@@ -483,6 +486,8 @@ class SQLitePipeline:
         )
 
     def close_spider(self, spider):
+        if not getattr(self, "enabled", False):
+            return
         try:
             self.con.commit()
         finally:
@@ -561,6 +566,9 @@ class SQLitePipeline:
         )
 
     def process_item(self, item, spider):
+        if not getattr(self, "enabled", False):
+            return item
+
         d = dict(item)
 
         if isinstance(item, PageRawItem):
@@ -583,7 +591,7 @@ class SQLitePipeline:
 
         return item
 
-# 8) JSONL pipeline 
+# 8) JSONL pipeline
 
 class JSONLPipeline:
     def open_spider(self, spider):
@@ -609,6 +617,7 @@ class JSONLPipeline:
                 "concurrent_requests": CONFIG["concurrent_requests"],
                 "timeout_s": CONFIG["timeout_s"],
                 "user_agent": CONFIG["user_agent"],
+                "write_db": CONFIG["write_db"],
             },
         }
         self.f.write(json.dumps(run_record, ensure_ascii=False) + "\n")
@@ -632,37 +641,15 @@ class JSONLPipeline:
         self.f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return item
 
-# 9) SPIDER 
-
-class GlobalProxyMiddleware:
-    """
-    Force Bright Data proxy on EVERY request (unless already set).
-    Automatically disabled when BrightData Unlocker API is active.
-    """
-    def process_request(self, request, spider):
-
-        if getattr(spider, "bd_mode", None) == "unlocker_api":
-            return None
-
-        proxy_url = getattr(spider, "proxy_url", None)
-        if proxy_url and not request.meta.get("proxy"):
-            request.meta["proxy"] = proxy_url
-
-            cnt = getattr(spider, "_proxy_applied_count", 0)
-            if cnt < 8:
-                spider.logger.info("Proxy applied -> %s | %s", proxy_url, request.url)
-            spider._proxy_applied_count = cnt + 1
-
-        return None
+# 9) SPIDER
 
 class CompetitorBenchmarkSpider(scrapy.Spider):
-    name = "maxiaxi_microfoons"
+    name = "maxiaxi_products"
     allowed_domains = ["www.maxiaxi.com", "maxiaxi.com"]
 
     custom_settings = {
         "USER_AGENT": CONFIG["user_agent"],
 
-        # Stable defaults
         "CONCURRENT_REQUESTS": 2,
         "DOWNLOAD_DELAY": 2.0,
         "AUTOTHROTTLE_ENABLED": True,
@@ -673,22 +660,19 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         "RETRY_TIMES": 2,
         "RETRY_HTTP_CODES": [403, 408, 429, 500, 502, 503, 504],
 
-        # IMPORTANT for stability
         "ROBOTSTXT_OBEY": False,
-
         "COOKIES_ENABLED": False,
         "LOG_LEVEL": "INFO",
 
         "DOWNLOADER_MIDDLEWARES": {
-
             f"{__name__}.BrightDataUnlockerMiddleware": 20,
-
             f"{__name__}.GlobalProxyMiddleware": 40,
             "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": 110,
         },
 
         "ITEM_PIPELINES": {
             f"{__name__}.JSONLPipeline": 400,
+            f"{__name__}.SQLitePipeline": 500,
         },
     }
 
@@ -696,7 +680,7 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         super().__init__(*args, **kwargs)
 
         self.bd_mode = brightdata_mode()
-        self.proxy_url = self._resolve_proxy_url() if self.bd_mode == "proxy" else None
+        self.proxy_url = resolve_brightdata_proxy_url() if self.bd_mode == "proxy" else None
 
         self.use_selenium = bool(CONFIG["use_selenium"])
         self.selenium_wait_s = int(CONFIG["selenium_wait_s"])
@@ -718,19 +702,6 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         self.logger.info("Proxy URL set: %s", bool(self.proxy_url))
         self.logger.info("Use selenium: %s wait: %s", self.use_selenium, self.selenium_wait_s)
 
-    def _resolve_proxy_url(self) -> str | None:
-        p = os.getenv("BRIGHTDATA_PROXY")
-        if p:
-            return p.strip()
-
-        user = os.getenv("BRIGHTDATA_USERNAME")
-        pwd = os.getenv("BRIGHTDATA_PASSWORD")
-        host = os.getenv("BRIGHTDATA_HOST")
-        port = os.getenv("BRIGHTDATA_PORT")
-        if user and pwd and host and port:
-            return f"http://{user}:{pwd}@{host}:{port}"
-        return None
-
     def _dump_response(self, response, label: str):
         if not CONFIG["debug_dump"]:
             return
@@ -741,27 +712,45 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         except Exception as exc:
             self.logger.warning("Could not save debug HTML err=%s", exc)
 
-    def maybe_render_with_selenium(self, url: str) -> str | None:
+    def _selenium_recover(self, response, label: str, callback):
+        """
+        If blocked/useless and selenium is enabled, render once and re-run the callback.
+        Prevents loops via response.meta['selenium_used'].
+        """
         if not self.use_selenium:
             return None
+        if response.meta.get("selenium_used"):
+            return None
+
+        url = response.url
         try:
-            return render_with_selenium(url, wait_seconds=self.selenium_wait_s)
+            html = render_with_selenium(url, wait_seconds=self.selenium_wait_s)
+            self.logger.warning("Selenium recovery succeeded: %s", url)
+            fake = HtmlResponse(url=url, body=html, encoding="utf-8", request=response.request)
+            fake.request.meta.update(response.meta)
+            fake.request.meta["selenium_used"] = True
+            return callback(fake)
         except Exception as exc:
-            self.logger.warning("Selenium render failed url=%s err=%s", url, exc)
+            self.logger.warning("Selenium recovery failed url=%s err=%s", url, exc)
             return None
 
     def errback_main(self, failure):
         req = failure.request
         self.logger.warning("Request failed: %s err=%s", req.url, repr(failure.value))
 
-        html = self.maybe_render_with_selenium(req.url)
-        if not html:
+        if not self.use_selenium:
             return
 
-        self.logger.warning("Selenium fallback succeeded: %s", req.url)
-        cb = req.callback or self.parse_listing
-        fake = HtmlResponse(url=req.url, body=html, encoding="utf-8", request=req)
-        return cb(fake)
+        try:
+            html = render_with_selenium(req.url, wait_seconds=self.selenium_wait_s)
+            self.logger.warning("Selenium fallback (errback) succeeded: %s", req.url)
+            cb = req.callback or self.parse_listing
+            fake = HtmlResponse(url=req.url, body=html, encoding="utf-8", request=req)
+            fake.request.meta["selenium_used"] = True
+            return cb(fake)
+        except Exception as exc:
+            self.logger.warning("Selenium fallback (errback) failed url=%s err=%s", req.url, exc)
+            return
 
     def errback_aux(self, failure):
         req = failure.request
@@ -773,7 +762,6 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         r_key = "maxiaxi"
         r = RETAILERS[r_key]
 
-        # auxiliary pages
         for _, url in (r.get("policy_urls") or {}).items():
             yield scrapy.Request(
                 url=strip_tracking(url),
@@ -807,6 +795,9 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
 
         if is_blocked_response(response):
             self._dump_response(response, "raw_page_blocked_or_useless")
+            recovered = self._selenium_recover(response, "raw_page", self.parse_raw_page)
+            if recovered is not None:
+                yield from recovered
             return
 
         yield PageRawItem(
@@ -821,6 +812,9 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
 
         if is_blocked_response(response):
             self._dump_response(response, f"listing_p{page_no}_blocked_or_useless")
+            recovered = self._selenium_recover(response, f"listing_p{page_no}", self.parse_listing)
+            if recovered is not None:
+                yield from recovered
             return
 
         raw_links = response.css(
@@ -831,21 +825,26 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
         links = [strip_tracking(urljoin(response.url, h)) for h in raw_links if h]
         links = list(dict.fromkeys(links))
 
-        def is_product_url(u: str) -> bool:
-            if not u or "maxiaxi.com" not in u:
+        # Relaxed filter: keep maxiaxi domain; exclude obvious non-product areas.
+        def looks_like_product_link(u: str) -> bool:
+            if not u:
                 return False
             low = u.lower()
-            if "/microfoons/" in low:
+            if "maxiaxi.com" not in low:
                 return False
-            if any(x in low for x in ["/klantenservice", "/advies", "/blog", "/account", "/checkout"]):
+            if any(x in low for x in ["/klantenservice", "/advies", "/blog", "/account", "/checkout", "/customer", "/cart", "/zoeken", "/search"]):
                 return False
-            return bool(re.match(r"^https://www\.maxiaxi\.com/[^/]+/?$", u))
+            # Many Magento product URLs can have varying depths; rely on selector + blacklist above.
+            return True
 
-        product_links = [u for u in links if is_product_url(u)]
+        product_links = [u for u in links if looks_like_product_link(u)]
         self.logger.info("LISTING found_links=%s product_links=%s", len(links), len(product_links))
 
         if not product_links:
             self._dump_response(response, f"listing_p{page_no}_no_links")
+            recovered = self._selenium_recover(response, f"listing_p{page_no}_no_links", self.parse_listing)
+            if recovered is not None:
+                yield from recovered
             return
 
         for u in product_links:
@@ -877,6 +876,9 @@ class CompetitorBenchmarkSpider(scrapy.Spider):
 
         if is_blocked_response(response):
             self._dump_response(response, "product_blocked_or_useless")
+            recovered = self._selenium_recover(response, "product", self.parse_product)
+            if recovered is not None:
+                yield from recovered
             return
 
         product_url = strip_tracking(response.url)
@@ -936,7 +938,7 @@ def run_scrape():
     print("Starting MaxiAxi spider (script mode). Run:", RUN_ID)
     print("Primary output:", JSONL_PATH)
     print("All export dirs:", [str(d) for d in EXPORT_DIRS])
-    print("DB path:", DB_PATH, "exists:", DB_PATH.exists())
+    print("DB path:", DB_PATH, "exists:", DB_PATH.exists(), "| WRITE_DB:", CONFIG["write_db"])
     print("BrightData mode:", brightdata_mode())
     print("Proxy URL set:", bool(resolve_brightdata_proxy_url()))
     print("Use selenium:", CONFIG["use_selenium"], "wait:", CONFIG["selenium_wait_s"])
