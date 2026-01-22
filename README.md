@@ -40,6 +40,8 @@ Each team member is responsible for specific components of the project:
 - Output: bol_support.jsonl
 - DB store: bol_visualization.ipynb
 
+The rest shraed files were modified from all team members.
+
 ## Execution 
 Instructions for spider execution: 
 
