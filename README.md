@@ -29,7 +29,9 @@ Each team member is responsible for specific components of the project:
 
 
 **Fedde Koster: Maxiaxi products spider**
-
+- Input: maxiaxi_products.py
+- Output: maxiaxi_items_{date}.json
+- DB store: maxiaxi db load.ipynb
 **Vanna Pušić: Thomann products spider**
 - input: thomann_products.py  output: thomann_products.json
 - output: thomann_support.py   output: thomann_support.json
