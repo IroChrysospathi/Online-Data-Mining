@@ -7,14 +7,8 @@ Responsibilities:
 - Yield structured product data for further processing
 """
 # thomann_products.py
-# NOTE: This version uses Selenium ONLY for listing pagination ("Toon meer").
-# Product pages remain pure Scrapy (fast + stable).
-#
-# What I removed as dead code (no longer needed):
-# - self._pages_seen_per_listing
-# - self.max_pages_per_listing
-# - pg= pagination logic
-# - set_query_param(...) (because we no longer force ls=100 and no longer do pg=)
+# This version uses Selenium only for listing pagination ("Toon meer").
+# Product pages remain pure Scrapy (fast + stable) and brightdata in terminal.
 
 import json
 import os
@@ -84,9 +78,9 @@ EXCLUDED_CATEGORY_KEYWORDS = {
 }
 
 
-# -------------------------
+
 # Helper functions
-# -------------------------
+
 
 def iso_utc_now() -> str:
     # I store timestamps in UTC for consistent comparisons across runs.
@@ -396,7 +390,7 @@ def extract_price_from_meta(response):
 
 def extract_price_from_buybox(response):
     """
-    Parse prices from a limited DOM block (NOT full body text),
+    Parse prices from a limited DOM block (Not full body text),
     to avoid picking up random numbers from scripts or unrelated content.
     Note: This should be used only to recover current_price, not to infer base_price.
     """
@@ -550,9 +544,9 @@ def extract_stock_from_html(response):
     return None, None
 
 
-# -------------------------
+
 # Spider
-# -------------------------
+
 
 class ThomannProductsSpider(scrapy.Spider):
     name = "thomann_products"
@@ -741,8 +735,8 @@ class ThomannProductsSpider(scrapy.Spider):
         Listing crawl strategy:
         - Discover & crawl subcategories (Scrapy)
         - Extract product URLs from the listing:
-          -> Use Selenium to click "Toon meer" until all items are loaded
-          -> Then parse the final rendered HTML with Scrapy Selector
+          Use Selenium to click "Toon meer" until all items are loaded
+          Then parse the final rendered HTML with Scrapy Selector
         """
         depth = int(response.meta.get("cat_depth", 0))
         self.logger.info("LISTING depth=%s %s", depth, response.url)

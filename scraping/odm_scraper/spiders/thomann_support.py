@@ -14,8 +14,8 @@ Goal:
 - Produce competitor-level Customer Service and Expert Support data for Thomann (competitor_id=4)
 
 Sources:
-1) Microphones category page (contact channels):
-   https://www.thomann.nl/alle-producten-in-de-categorie-microfoons.html
+1) Contact and delivery page (contact channels):
+   https://www.thomann.nl/compinfo_contact.html & https://www.thomann.nl/helpdesk_shipping.html
 2) Product pages (money-back + warranty text often appears):
    loaded via -a input_file=... (JSONL/JSON/CSV), typically the output of thomann_products spider.
 
@@ -120,6 +120,8 @@ def is_cookie_consent_text(text: str) -> bool:
 
 
 def stable_int_key(s: str, *, mod: int = 2_000_000_000) -> int:
+    # Generate a stable integer key from a string using SHA-1 hashing
+    # Used to create reproducible numeric IDs (e.g. for deduplication)
     if s is None:
         s = ""
     h = hashlib.sha1(s.encode("utf-8")).hexdigest()
@@ -127,6 +129,8 @@ def stable_int_key(s: str, *, mod: int = 2_000_000_000) -> int:
 
 
 def to_decimal_eur(s):
+    # Convert a European-formatted price string to a float (EUR)
+    # Handles symbols, thousand separators, and commas as decimals
     if s is None:
         return None
     s = str(s).strip().replace("€", "").strip()
@@ -141,11 +145,13 @@ def to_decimal_eur(s):
 
 
 def text_has_any(text, words):
+    # Check whether any of the given words appear in the text (case-insensitive)
     t = (text or "").lower()
     return any(w.lower() in t for w in words)
 
 
 def is_thomann_domain(url: str) -> bool:
+    # Verify that a URL belongs to the thomann.nl domain
     if not url:
         return False
     try:
@@ -179,8 +185,11 @@ def brightdata_proxy_url():
 
 
 # Selenium fallback
+# Used when the normal HTML response looks like a blocked page, cookie wall,
+# or an incomplete "shell" (too little content). Selenium renders the page like a real browser to retrieve the full HTML.
 
 BLOCKED_MARKERS = [
+    # Common indicators of cookie banners, consent dialogs, bot protection, etc.
     "this is a modal window",
     "beginning of dialog window",
     "cookie",
@@ -196,6 +205,7 @@ BLOCKED_MARKERS = [
 
 
 def looks_like_shell_or_blocked_html(html):
+    # Heuristic: return True when the HTML likely isn't the real page content
     if not html:
         return True
     low = html.lower()
@@ -207,6 +217,7 @@ def looks_like_shell_or_blocked_html(html):
 
 
 def selenium_enabled():
+    # Toggle Selenium usage via env var: USE_SELENIUM=1/true/yes/on
     return str(os.getenv("USE_SELENIUM", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
@@ -219,6 +230,7 @@ def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
     from selenium.webdriver.support import expected_conditions as EC
     import time
 
+    # Optional: allow user-provided chromedriver path via env var
     chromedriver_path = os.getenv("CHROMEDRIVER")
     service = Service(chromedriver_path) if chromedriver_path else Service()
 
@@ -229,6 +241,7 @@ def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--window-size=1365,900")
     options.add_argument(
+            # Set a realistic user-agent to reduce bot detection
         "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
     )
@@ -236,8 +249,9 @@ def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
     driver = webdriver.Chrome(service=service, options=options)
     try:
         driver.get(url)
-        time.sleep(1.2)
+        time.sleep(1.2) # brief initial load delay
 
+      # Try to dismiss common cookie/consent dialogs (best-effort)
         for xpath in [
             "//button[contains(translate(., 'AKKOORDACCEPT', 'akkoordaccept'), 'akkoord')]",
             "//button[contains(translate(., 'AKKOORDACCEPT', 'akkoordaccept'), 'accept')]",
@@ -250,7 +264,7 @@ def render_with_selenium(url: str, wait_seconds: int = 6) -> str:
                 break
             except Exception:
                 pass
-
+        # Wait until the page looks "complete enough" (body exists and is large)
         wait = WebDriverWait(driver, max(2, int(wait_seconds)))
         try:
             wait.until(lambda d: (len(d.find_elements(By.CSS_SELECTOR, "body")) > 0 and len(d.page_source) > 30_000))
@@ -270,6 +284,7 @@ class ThomannSupportSpider(scrapy.Spider):
     allowed_domains = ["thomann.nl"]
     handle_httpstatus_list = [404]
 
+   # Thomann pages used for global support/shipping/contact info
     HELPdesk_SHIPPING_URL = "https://www.thomann.nl/helpdesk_shipping.html"
     CONTACT_URL = "https://www.thomann.nl/compinfo_contact.html"
 
@@ -292,22 +307,24 @@ class ThomannSupportSpider(scrapy.Spider):
     def __init__(self, input_file=None, selenium_wait=6, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+       # Input file: products export (JSON or JSONL) used to get product URLs/listing_ids
         self.input_file = input_file
 
+       # Selenium wait time (seconds) for fallback rendering
         try:
             self.selenium_wait = int(selenium_wait)
         except Exception:
             self.selenium_wait = 6
 
-        # Bright Data is mandatory
+        # Bright Data proxy is required for reliability / anti-bot mitigation
         self.proxy_url = brightdata_proxy_url()
         if not self.proxy_url:
             raise RuntimeError(
-                "Bright Data proxy is mandatory but not configured. "
+                
                 "Set BRIGHTDATA_PROXY or BRIGHTDATA_USERNAME/BRIGHTDATA_PASSWORD/BRIGHTDATA_HOST/BRIGHTDATA_PORT."
             )
 
-        # Global values scraped once
+        # Global values scraped once (applied to every listing output)
         self.global_customer_service = {
             "free_shipping_threshold_amt": None,
             "delivery_courier_available": None,  # will be set True/False on helpdesk page
@@ -319,14 +336,16 @@ class ThomannSupportSpider(scrapy.Spider):
             "expert_support_text": None,
             "customer_service_url": self.CONTACT_URL,
         }
-
+         # Load product rows from the products export file
         self.product_rows = self._load_products(self.input_file)
         self.logger.info("Loaded %s product rows from input_file=%s", len(self.product_rows), self.input_file)
 
     def _base_meta(self):
+         # Attach proxy settings to each request
         return {"proxy": self.proxy_url}
 
     def maybe_render(self, response):
+        # If Selenium is enabled and the HTML looks blocked/incomplete, re-render it
         if not selenium_enabled():
             return response
         html = response.text or ""
@@ -361,6 +380,7 @@ class ThomannSupportSpider(scrapy.Spider):
             return rows
 
         def add_obj(obj):
+            # Keep only product records from thomann.nl, and build a minimal row dict
             if not isinstance(obj, dict):
                 return
             if obj.get("type") != "product":
@@ -407,6 +427,8 @@ class ThomannSupportSpider(scrapy.Spider):
     # Crawl
 
     def start_requests(self):
+        # Start by fetching global helpdesk/shipping info first,
+        # then the contact page, and finally loop over all product URLs.
         if not self.product_rows:
             self.logger.error("No product URLs loaded. Use -a input_file=... with type=product lines.")
             return
@@ -419,11 +441,13 @@ class ThomannSupportSpider(scrapy.Spider):
         )
 
     def parse_helpdesk_shipping(self, response):
+        # Optionally re-render with Selenium if the HTML looks blocked/incomplete
         response = self.maybe_render(response)
 
         if response.status == 404:
             self.logger.warning("helpdesk_shipping returned 404: %s", response.url)
         else:
+            # Extract visible text and detect free shipping threshold
             full_text = visible_body_text(response)
 
             m = re.search(
@@ -434,7 +458,7 @@ class ThomannSupportSpider(scrapy.Spider):
             if m:
                 self.global_customer_service["free_shipping_threshold_amt"] = to_decimal_eur(m.group(1))
 
-            # ONLY change: make delivery_courier_available robust (text + attributes)
+            # Determine whether courier delivery is mentioned (robust: text + attributes)
             self.global_customer_service["delivery_courier_available"] = has_delivery_courier(response)
 
         yield scrapy.Request(
@@ -445,20 +469,24 @@ class ThomannSupportSpider(scrapy.Spider):
         )
 
     def parse_contact(self, response):
+        # Optionally re-render with Selenium if needed
         response = self.maybe_render(response)
 
         if response.status == 404:
             self.logger.warning("contact page returned 404: %s", response.url)
         else:
+            # Parse visible body text to detect support channels (chat/email/phone)
             full_text = visible_body_text(response)
 
             if text_has_any(full_text, ["chat", "chat nu", "chatten", "chat met"]):
                 self.global_expert_support["expert_chat_available"] = True
-
+       
+            # Email can be detected via mailto links or email patterns in text
             mailtos = response.css("a[href^='mailto:']::attr(href)").getall()
             if mailtos or re.search(r"\b[a-z0-9._%+\-]+@thomann\.[a-z]{2,}\b", full_text, re.IGNORECASE):
                 self.global_expert_support["email_support_available"] = True
 
+            # Phone detection via a loose international phone pattern
             if re.search(r"\+\d{1,3}[\s\-]?\d{1,4}[\s\-]?\d{2,4}[\s\-]?\d{2,6}", full_text):
                 self.global_expert_support["phone_support_available"] = True
 
@@ -470,15 +498,18 @@ class ThomannSupportSpider(scrapy.Spider):
                 expert_text = None
             self.global_expert_support["expert_support_text"] = expert_text
 
+       # After globals are set, crawl each product page
         for row in self.product_rows:
             yield scrapy.Request(
                 row["product_url"],
                 callback=self.parse_product,
+                # Pass listing_id/listing_key/product_url via meta for downstream inserts
                 meta={**self._base_meta(), **row},
                 dont_filter=True,
             )
 
     def parse_product(self, response):
+         # Optionally re-render with Selenium if needed
         response = self.maybe_render(response)
 
         scraped_at = iso_utc_now()
@@ -488,16 +519,19 @@ class ThomannSupportSpider(scrapy.Spider):
 
         full_text = visible_body_text(response)
 
+        # shipping included if "standard delivery" + "free" appears
         shipping_included = None
         if text_has_any(full_text, ["standaard levering"]) and text_has_any(full_text, ["gratis"]):
             shipping_included = True
         elif text_has_any(full_text, ["verzendkosten", "bezorgkosten"]):
             shipping_included = False
 
+        # Availability/delivery info 
         delivery_shipping_available = True if text_has_any(
             full_text, ["levering binnen", "levertijd", "werkdagen", "direct leverbaar"]
         ) else None
-
+        
+        # Cooling-off / money-back period (days)
         cooling_off_days = None
         m = re.search(r"(\d+)\s*dagen\s*(?:money-?back|moneyback|bedenktijd)", full_text, re.IGNORECASE)
         if m:
@@ -506,6 +540,7 @@ class ThomannSupportSpider(scrapy.Spider):
             except Exception:
                 cooling_off_days = None
 
+        # Warranty detection (Thomann guarantee patterns)
         warranty_provider = None
         warranty_duration_months = None
 
@@ -523,6 +558,7 @@ class ThomannSupportSpider(scrapy.Spider):
                 warranty_provider = COMPETITOR_NAME
                 warranty_duration_months = 36
 
+        # Try to find a relevant support/helpdesk/contact link on the product page
         customer_service_url = None
         for h in response.css("a::attr(href)").getall():
             if not h:
@@ -537,6 +573,7 @@ class ThomannSupportSpider(scrapy.Spider):
         if customer_service_url is None:
             customer_service_url = self.global_expert_support.get("customer_service_url") or self.CONTACT_URL
 
+        # Emit customer service record for this listing (includes global + per-page fields)
         yield {
             "type": "CUSTOMER_SERVICE",
             "competitor_id": COMPETITOR_ID,
@@ -556,7 +593,7 @@ class ThomannSupportSpider(scrapy.Spider):
             "listing_key": listing_key,
             "product_url": product_url,
         }
-
+        # Emit expert support record (global contact/support channels + per-listing source_url)
         yield {
             "type": "EXPERT_SUPPORT",
             "competitor_id": COMPETITOR_ID,
