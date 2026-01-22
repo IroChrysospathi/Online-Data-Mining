@@ -31,6 +31,9 @@ Each team member is responsible for specific components of the project:
 **Fedde Koster: Maxiaxi products spider**
 
 **Vanna Pušić: Thomann products spider**
+- input: thomann_products.py  output: thomann_products.json
+- output: thomann_support.py   output: thomann_support.json
+- DB: thomann db load.ipynb
 
 **Iro Chrysospathi: Bol products/support spider**
 
@@ -84,6 +87,10 @@ export BRIGHTDATA_ZONE="Name"
 export USE_SELENIUM=1
 
 scrapy crawl thomann_products -O ../../../data/raw/thomann/thomann_products.json
+
+scrapy crawl bol_support \
+  -a input_file=../../../data/raw/thomannl/thomann_support.json \
+  -O ../../../data/raw/thomann/thomann_support.json
 
 ### Maxiaxi: 
 
