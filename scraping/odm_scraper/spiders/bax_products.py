@@ -1,10 +1,12 @@
 """
-Product spider.
+Product spider (BAX_shop) - Luuk Hoogeveen
 
 Responsibilities:
-- Crawl product listing and product detail pages for a specific webshop
-- Extract relevant product information (e.g., name, price, URL)
-- Yield structured product data for further processing
+- Start from Bax category pages (and sitemaps) to discover product listings while respecting robots.txt.
+- Follow pagination/listing pages and capture listing metadata such as category, breadcrumb, and priority signals.
+- Visit each product detail page, extract structured fields (name, price, availability, specs, identifiers), and normalize them before yielding items for the pipeline.
+- Route requests through the shared middlewares; Selenium for JS-heavy pages (if actived by doing USE_SELENIUM) and the Bright Data proxy; to keep the crawl polite and resilient.
+
 """
 
 import json
