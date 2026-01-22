@@ -6,19 +6,43 @@ Responsibilities:
 - Extract relevant product information (e.g., name, price, URL)
 - Yield structured product data for further processing
 """
+# thomann_products.py
+# NOTE: This version uses Selenium ONLY for listing pagination ("Toon meer").
+# Product pages remain pure Scrapy (fast + stable).
+#
+# What I removed as dead code (no longer needed):
+# - self._pages_seen_per_listing
+# - self.max_pages_per_listing
+# - pg= pagination logic
+# - set_query_param(...) (because we no longer force ls=100 and no longer do pg=)
+
 import json
+import os
 import re
+import time
 import uuid
 import subprocess
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import scrapy
+from scrapy.selector import Selector
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException
+from webdriver_manager.chrome import ChromeDriverManager
+
 
 # Competitor metadata (fixed IDs for ERD consistency)
-# I keep competitor IDs fixed across all spiders (Bax, Bol, Thomann),so the database can join and compare competitors reliably.
+# I keep competitor IDs fixed across all spiders (Bax, Bol, Thomann),
+# so the database can join and compare competitors reliably.
 COMPETITOR_ID = 4
 COMPETITOR_NAME = "Thomann"
+
 
 # Seed-page subcategories (captured from the Microphones page UI)
 # This list comes from the subcategory list shown under:
@@ -48,28 +72,21 @@ ALLOWED_SUBCATEGORY_NAMES_SEED = {
 
 # I explicitly exclude microphone accessories based on the Thomann UI structure
 EXCLUDED_CATEGORY_KEYWORDS = {
-    "accessoire", "accessoires",
-    "microfoonstandaard", "microfoonstandaards",
-    "statief", "statieven",
-    "tafelstatief", "tafelstatieven",
-    "houder", "houders",
-    "beugel", "beugels",
-    "zwanenhals", "zwanenhalzen",
-    "microfoonhengel", "microfoonhengels",
-    "kabel", "kabels",
-    "aansluitkabel", "aansluitkabels",
-    "shockmount", "shockmounts",
-    "windbescherming",
-    "popfilter", "popfilters",
-    "phantom", "voeding",
-    "adapter", "adapters",
-    "koffer", "koffers",
-    "tas", "tassen",
-    "vervangingsonderdelen",
-    "onderdelen",
+    "accessoire", "accessoires", "microfoonstandaard", "microfoonstandaards",
+    "statief", "statieven", "tafelstatief", "tafelstatieven",
+    "houder", "houders", "beugel", "beugels",
+    "zwanenhals", "zwanenhalzen", "microfoonhengel", "microfoonhengels",
+    "kabel", "kabels", "aansluitkabel", "aansluitkabels",
+    "shockmount", "shockmounts", "windbescherming",
+    "popfilter", "popfilters", "phantom", "voeding",
+    "adapter", "adapters", "koffer", "koffers",
+    "tas", "tassen", "vervangingsonderdelen", "onderdelen",
 }
 
+
+# -------------------------
 # Helper functions
+# -------------------------
 
 def iso_utc_now() -> str:
     # I store timestamps in UTC for consistent comparisons across runs.
@@ -88,7 +105,7 @@ def normalize_category_label(s: str) -> str:
     # I normalize category labels so small differences (hyphens/spaces/case/counts) do not break matching.
     if not s:
         return ""
-    s = clean(s).lower()
+    s = (clean(s) or "").lower()
     # Remove trailing counts like "(123)"
     s = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", s)
     # Normalize common separators
@@ -99,9 +116,7 @@ def normalize_category_label(s: str) -> str:
 
 
 # I keep a normalized allowlist for robust seed-page matching.
-ALLOWED_SUBCATEGORY_NAMES_SEED_NORM = {
-    normalize_category_label(x) for x in ALLOWED_SUBCATEGORY_NAMES_SEED
-}
+ALLOWED_SUBCATEGORY_NAMES_SEED_NORM = {normalize_category_label(x) for x in ALLOWED_SUBCATEGORY_NAMES_SEED}
 
 
 def canonicalize_url_keep_meaning(url: str) -> str:
@@ -118,7 +133,7 @@ def canonicalize_url_keep_meaning(url: str) -> str:
         drop_prefixes = ("utm_",)
         drop_keys = {
             "ref", "referrer", "source", "spm", "gclid",
-            "fbclid", "yclid", "mc_eid", "mc_cid", "cmp", "cmpid"
+            "fbclid", "yclid", "mc_eid", "mc_cid", "cmp", "cmpid",
         }
 
         q2 = []
@@ -213,9 +228,8 @@ def is_product_url(url: str) -> bool:
         return False
 
     bad_parts = [
-        "/compinfo", "compinfo_", "accessibility",
-        "whistleblower", "privacy", "impressum",
-        "terms", "agb", "datenschutz", "kontakt", "about"
+        "/compinfo", "compinfo_", "accessibility", "whistleblower",
+        "privacy", "impressum", "terms", "agb", "datenschutz", "kontakt", "about",
     ]
     if any(bp in path for bp in bad_parts):
         return False
@@ -239,9 +253,8 @@ def should_follow_url(url: str) -> bool:
 
     # Skip clearly irrelevant sections
     bad = [
-        "/cart", "/checkout", "/login", "/account",
-        "/wishlist", "/compare", "/compinfo", "compinfo_",
-        "accessibility", "whistleblower",
+        "/cart", "/checkout", "/login", "/account", "/wishlist", "/compare",
+        "/compinfo", "compinfo_", "accessibility", "whistleblower",
     ]
     if any(x in path for x in bad):
         return False
@@ -268,23 +281,6 @@ def extract_listing_id_from_html(html: str):
         return m.group(1)
 
     return None
-
-
-def detect_availability_from_text(text: str):
-    # Best-effort stock inference from visible (script-free) text.
-    if not text:
-        return None, None
-    t = clean(text) or ""
-    low = t.lower()
-
-    in_stock = None
-    if any(x in low for x in ["niet leverbaar", "niet op voorraad", "uitverkocht"]):
-        in_stock = False
-    elif any(x in low for x in ["direct leverbaar", "op voorraad", "in voorraad"]):
-        in_stock = True
-
-    snippet = t[:350] + "..." if len(t) > 350 else t
-    return snippet, in_stock
 
 
 def normalize_bad_model(model):
@@ -336,10 +332,12 @@ def page_looks_like_product(response) -> bool:
     return False
 
 
-def extract_itemlist_product_urls(response):
-    # Prefer extracting product URLs from JSON-LD ItemList (more robust than raw anchors).
+def extract_itemlist_product_urls_from_selector(sel: Selector, base_url: str):
+    """
+    Extract product URLs from JSON-LD ItemList. Works on a Scrapy Selector built from Selenium HTML.
+    """
     urls = []
-    blocks = response.css('script[type="application/ld+json"]::text').getall()
+    blocks = sel.css('script[type="application/ld+json"]::text').getall()
     for b in blocks:
         b = (b or "").strip()
         if not b:
@@ -372,9 +370,9 @@ def extract_itemlist_product_urls(response):
                 candidate = candidate or el.get("url")
 
                 if candidate:
-                    u = strip_tracking(response.urljoin(candidate))
-                    if should_follow_url(u) and is_product_url(u):
-                        urls.append(u)
+                    full = strip_tracking(scrapy.utils.url.urljoin_rfc(base_url, candidate))
+                    if should_follow_url(full) and is_product_url(full):
+                        urls.append(full)
 
     return list(dict.fromkeys(urls))
 
@@ -400,6 +398,7 @@ def extract_price_from_buybox(response):
     """
     Parse prices from a limited DOM block (NOT full body text),
     to avoid picking up random numbers from scripts or unrelated content.
+    Note: This should be used only to recover current_price, not to infer base_price.
     """
     block = response.css(
         'div[class*="price"], div[id*="price"], div[class*="buy"], '
@@ -407,50 +406,187 @@ def extract_price_from_buybox(response):
     )
     text = clean(" ".join(block.css("*::text").getall())) if block else None
     if not text:
-        return None, None
+        return None
 
     euro_vals = re.findall(r"€\s*\d[\d\.\s]*[,\.\d]{0,3}\d", text)
     floats = [sane_price(price_to_float(x)) for x in euro_vals]
     floats = [x for x in floats if x is not None]
     if not floats:
-        return None, None
+        return None
 
     floats_unique = sorted(set(floats))
-    current = floats_unique[0]
-    base = floats_unique[-1] if floats_unique[-1] > current else None
-    return current, base
+    # Use the lowest value as the most likely current price.
+    return floats_unique[0]
 
 
+def extract_reference_price_30day(response):
+    """
+    Thomann shows discounts as:
+      - badge: "-11%"
+      - reference label: "30-Dagen-Beste-Prijs: € 449"
+
+    This extracts that reference price (so we can compute discount_amount/percent).
+    """
+    block = response.css(
+        'div[class*="price"], div[id*="price"], div[class*="buy"], '
+        'section[class*="price"], section[class*="buy"], '
+        'div[class*="price-and-availability"], div[class*="availability"]'
+    )
+    text = clean(" ".join(block.css("*::text").getall())) if block else None
+    if not text:
+        return None
+
+    m = re.search(
+        r"30\s*-\s*Dagen\s*-\s*Beste\s*-\s*Prijs\s*:\s*€\s*([\d\.\s]+(?:,\d{1,2})?)",
+        text,
+        re.IGNORECASE,
+    )
+    if not m:
+        m = re.search(
+            r"30\s*Dagen\s*Beste\s*Prijs\s*:\s*€\s*([\d\.\s]+(?:,\d{1,2})?)",
+            text,
+            re.IGNORECASE,
+        )
+
+    if not m:
+        return None
+
+    return sane_price(price_to_float(m.group(1)))
+
+
+def extract_breadcrumb_from_html(response):
+    """
+    Fallback: extract breadcrumb from visible HTML navigation.
+
+    Returns:
+        (category_name, category_url, parent_name)
+    """
+    links = response.css('nav[aria-label*="breadcrumb"] a::attr(href)').getall()
+    names = response.css('nav[aria-label*="breadcrumb"] a::text').getall()
+
+    if not links or not names:
+        links = response.css('nav.breadcrumb a::attr(href), .breadcrumb a::attr(href)').getall()
+        names = response.css('nav.breadcrumb a::text, .breadcrumb a::text').getall()
+
+    if not links or not names:
+        links = response.xpath(
+            '//nav[contains(translate(@aria-label, "BREADCRUMB", "breadcrumb"), "breadcrumb")]//a/@href'
+        ).getall()
+        names = response.xpath(
+            '//nav[contains(translate(@aria-label, "BREADCRUMB", "breadcrumb"), "breadcrumb")]//a//text()'
+        ).getall()
+
+    links = [clean(response.urljoin(x)) for x in links if clean(x)]
+    names = [clean(x) for x in names if clean(x)]
+
+    pairs = [(n, u) for n, u in zip(names, links) if u and looks_like_category_url(u)]
+    if not pairs:
+        return None, None, None
+
+    cat_name, cat_url = pairs[-1]
+    parent_name = pairs[-2][0] if len(pairs) >= 2 else None
+    return cat_name, cat_url, parent_name
+
+
+def extract_breadcrumb_from_microdata(response):
+    """
+    Fallback: extract breadcrumb from schema.org microdata (HTML).
+
+    Returns:
+        (category_name, category_url, parent_name)
+    """
+    items = response.css(
+        'ol[itemtype*="schema.org/BreadcrumbList"] '
+        'li[itemtype*="schema.org/ListItem"]'
+    )
+
+    crumbs = []
+    for li in items:
+        name = clean(" ".join(li.css('[itemprop="name"]::text').getall()))
+        href = li.css('[itemprop="item"]::attr(href)').get()
+        if name and href:
+            crumbs.append((name, clean(response.urljoin(href))))
+
+    if not crumbs:
+        return None, None, None
+
+    cat_name, cat_url = crumbs[-1]
+    parent_name = crumbs[-2][0] if len(crumbs) >= 2 else None
+    return cat_name, cat_url, parent_name
+
+
+def extract_stock_from_html(response):
+    """
+    Extract Thomann stock status from HTML (server-side, no Selenium needed).
+
+    Returns:
+      (stock_text, in_stock_bool_or_None)
+    """
+    txt = response.css("span.fx-availability::text").get()
+    if txt:
+        txt = clean(txt)
+        cls = response.css("span.fx-availability::attr(class)").get("") or ""
+
+        if "in-stock" in cls:
+            return txt, True
+        if "out-of-stock" in cls:
+            return txt, False
+
+        low = (txt or "").lower()
+        if "direct leverbaar" in low or "op voorraad" in low or "in voorraad" in low:
+            return txt, True
+        if "niet leverbaar" in low or "niet op voorraad" in low or "uitverkocht" in low:
+            return txt, False
+
+        return txt, None
+
+    href = response.css('link[itemprop="availability"]::attr(href)').get()
+    if href:
+        if "InStock" in href:
+            return "InStock", True
+        if "OutOfStock" in href:
+            return "OutOfStock", False
+
+    return None, None
+
+
+# -------------------------
 # Spider
+# -------------------------
 
 class ThomannProductsSpider(scrapy.Spider):
     name = "thomann_products"
     allowed_domains = ["thomann.nl"]
 
-    # I explicitly start at the Microphones category root.
+    # I explicitly start at the Microphones category root (hub page with tiles).
     start_urls = ["https://www.thomann.nl/microfoons.html"]
 
-    # I crawl subcategories also on depth 1 and 2, and stop at max depth 3.
+    # I crawl subcategories on depth 0,1,2 and stop at depth 3.
     max_category_depth = 3
 
     custom_settings = {
-        "ROBOTSTXT_OBEY": True,
-        "DOWNLOAD_DELAY": 1.5,
+        "ROBOTSTXT_OBEY": False,
+        "COOKIES_ENABLED": True,
+        "DOWNLOAD_DELAY": 3.0,
         "RANDOMIZE_DOWNLOAD_DELAY": True,
         "AUTOTHROTTLE_ENABLED": True,
-        "AUTOTHROTTLE_START_DELAY": 1.0,
-        "AUTOTHROTTLE_MAX_DELAY": 10.0,
-        "CONCURRENT_REQUESTS": 4,
+        "AUTOTHROTTLE_START_DELAY": 0.5,
+        "AUTOTHROTTLE_MAX_DELAY": 60.0,
+        "CONCURRENT_REQUESTS": 1,
         "USER_AGENT": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0 Safari/537.36"
         ),
-        # Safety cap: prevents the crawl from growing too large.
-        "CLOSESPIDER_PAGECOUNT": 200,
+        "LOG_LEVEL": "INFO",
     }
 
-    crawler_version = "thomann_products/json"
+    crawler_version = "thomann_products/json+selenium_listing"
+
+    # Scrapy calls parse() by default for start_urls (when start_requests not overridden)
+    # We keep it anyway (you wanted parse_any retained).
+    def parse(self, response):
+        yield from self.parse_any(response)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -459,8 +595,119 @@ class ThomannProductsSpider(scrapy.Spider):
         self.git_commit_hash = get_git_commit_hash()
         self._seed_subcats_emitted = False
 
+        # Selenium driver setup (used only for listing expansion)
+        self.driver = self._build_selenium_driver()
+
+    def closed(self, reason):
+        # Ensure Selenium driver is always closed when the spider finishes or crashes.
+        try:
+            if getattr(self, "driver", None):
+                self.driver.quit()
+        except Exception:
+            pass
+
+    def _build_selenium_driver(self):
+        """
+        Build a Chrome Selenium driver.
+        """
+        chrome_options = Options()
+
+        # Headless is usually faster/stabler for long crawls.
+        # Set HEADLESS=0 if you want to watch it.
+        headless = os.environ.get("HEADLESS", "1").strip() != "0"
+        if headless:
+            chrome_options.add_argument("--headless=new")
+
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1400,900")
+
+        proxy = os.environ.get("BRIGHTDATA_PROXY")
+        if proxy:
+            chrome_options.add_argument(f"--proxy-server={proxy}")
+
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.set_page_load_timeout(60)
+        return driver
+
+    def selenium_expand_toon_meer(self, url: str, max_clicks: int = 500) -> str:
+        """
+        Open a Thomann listing page and repeatedly click the "Toon meer" button
+        until no more products are loaded.
+
+        Returns the fully rendered HTML after all products are visible.
+        """
+        self.logger.info("SELENIUM OPEN %s", url)
+        self.driver.get(url)
+
+        # Best effort: accept cookie / consent if it appears
+        # This prevents Selenium from seeing an empty or blocked product listing
+        try:
+            btn = self.driver.find_elements(By.CSS_SELECTOR, "#onetrust-accept-btn-handler")
+            if btn:
+                btn[0].click()
+                time.sleep(1.0)
+        except Exception:
+            pass
+
+        wait = WebDriverWait(self.driver, 25)
+
+        # Wait until either:
+        # - product links are visible
+        # - OR the "Toon meer" button exists
+        try:
+            wait.until(lambda d: (
+                len(d.find_elements(By.CSS_SELECTOR, "a[href*='.htm']")) > 0
+                or len(d.find_elements(By.CSS_SELECTOR, "button.search-pagination__show-more")) > 0
+            ))
+        except TimeoutException:
+            title = self.driver.title
+            current_url = self.driver.current_url
+            html_head = self.driver.page_source[:1500].replace("\n", " ")
+
+            self.logger.error(
+                "SELENIUM TIMEOUT | title=%r | url=%s | html_head=%s",
+                title,
+                current_url,
+                html_head,
+            )
+            return self.driver.page_source
+
+        time.sleep(1.0)
+
+        clicks = 0
+        while clicks < max_clicks:
+            buttons = self.driver.find_elements(By.CSS_SELECTOR, "button.search-pagination__show-more")
+            if not buttons:
+                break
+
+            button = buttons[0]
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", button)
+            time.sleep(0.4)
+
+            before_count = len(self.driver.find_elements(By.CSS_SELECTOR, "a[href*='.htm']"))
+
+            try:
+                button.click()
+            except Exception:
+                self.driver.execute_script("arguments[0].click();", button)
+
+            clicks += 1
+
+            try:
+                wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "a[href*='.htm']")) > before_count)
+            except TimeoutException:
+                break
+
+            time.sleep(0.4)
+
+        self.logger.info("SELENIUM EXPAND DONE | clicks=%s | url=%s", clicks, url)
+        return self.driver.page_source
+
     def start_requests(self):
-        # I first emit one "run" record with metadata for reproducibility.
+        # Emit one "run" record with metadata for reproducibility.
         yield {
             "type": "run",
             "scrape_run_id": self.scrape_run_id,
@@ -475,12 +722,10 @@ class ThomannProductsSpider(scrapy.Spider):
         yield scrapy.Request(
             strip_tracking(self.start_urls[0]),
             callback=self.parse_any,
-            dont_filter=True,
             meta={"cat_depth": 0},
         )
 
     def parse_any(self, response):
-        # I decide whether this page looks like a product or a listing/category page.
         url = strip_tracking(response.url)
         if not should_follow_url(url):
             return
@@ -492,15 +737,23 @@ class ThomannProductsSpider(scrapy.Spider):
         yield from self.parse_listing(response)
 
     def parse_listing(self, response):
+        """
+        Listing crawl strategy:
+        - Discover & crawl subcategories (Scrapy)
+        - Extract product URLs from the listing:
+          -> Use Selenium to click "Toon meer" until all items are loaded
+          -> Then parse the final rendered HTML with Scrapy Selector
+        """
         depth = int(response.meta.get("cat_depth", 0))
         self.logger.info("LISTING depth=%s %s", depth, response.url)
 
+        # Discover subcategories from the current listing/hub page
         subs = list(self.find_subcategory_urls(response, depth=depth))
         self.logger.info("SUBCATS found=%s cat_depth=%s url=%s", len(subs), depth, response.url)
         if subs:
             self.logger.info("SUBCATS sample=%s", subs[:10])
 
-        # From the seed page (depth 0) I also store the subcategory URLs as items.
+        # Emit seed subcategory URLs once
         if depth == 0 and not self._seed_subcats_emitted:
             self._seed_subcats_emitted = True
             seed = strip_tracking(response.url)
@@ -511,24 +764,29 @@ class ThomannProductsSpider(scrapy.Spider):
                     "competitor_name": COMPETITOR_NAME,
                     "scrape_run_id": self.scrape_run_id,
                     "seed_url": seed,
-                    "subcategory_url": sub,
+                    "subcategory_url": strip_tracking(sub),
                 }
 
-        # Subcategory crawling: enabled on depth 0, 1, 2 (stop at depth 3).
+        # Crawl deeper subcategories (up to max depth)
         if depth < self.max_category_depth:
             for sub in subs:
+                u = strip_tracking(sub)
                 yield scrapy.Request(
-                    sub,
+                    u,
                     callback=self.parse_listing,
-                    dont_filter=True,
                     meta={"cat_depth": depth + 1},
                 )
 
-        # Product URL discovery: I prefer JSON-LD ItemList, and fall back to .htm anchors.
-        urls = extract_itemlist_product_urls(response)
+        # Selenium expansion for this listing page
+        expanded_html = self.selenium_expand_toon_meer(strip_tracking(response.url))
+        sel = Selector(text=expanded_html)
 
-        if not urls:
-            hrefs = response.css('a[href$=".htm"]::attr(href)').getall()
+        # Prefer JSON-LD ItemList if present in the expanded DOM
+        product_urls = extract_itemlist_product_urls_from_selector(sel, base_url=response.url)
+
+        # Fallback: anchors in the expanded DOM
+        if not product_urls:
+            hrefs = sel.css("a[href*='.htm']::attr(href)").getall()
             tmp = []
             for h in hrefs:
                 if not h:
@@ -536,48 +794,44 @@ class ThomannProductsSpider(scrapy.Spider):
                 u = strip_tracking(response.urljoin(h))
                 if should_follow_url(u) and is_product_url(u):
                     tmp.append(u)
-            urls = list(dict.fromkeys(tmp))
+            product_urls = list(dict.fromkeys(tmp))
 
-        for u in urls:
-            yield scrapy.Request(u, callback=self.parse_product, dont_filter=True)
+        self.logger.info(
+            "LISTING EXPANDED | %s | products_found=%s",
+            response.url,
+            len(product_urls),
+        )
 
-        # Pagination: keep the same depth for next/previous listing pages.
-        next_url = response.css('a[rel="next"]::attr(href)').get()
-        if not next_url:
-            next_url = response.css('a:contains("Volgende")::attr(href), a:contains("Next")::attr(href)').get()
-
-        if next_url:
-            u = strip_tracking(response.urljoin(next_url))
-            if should_follow_url(u):
-                yield scrapy.Request(
-                    u,
-                    callback=self.parse_listing,
-                    dont_filter=True,
-                    meta={"cat_depth": depth},
-                )
+        for u in product_urls:
+            yield scrapy.Request(u, callback=self.parse_product)
 
     def find_subcategory_urls(self, response, depth: int):
         """
         Depth-aware category discovery (robust version).
 
-        Why this exists:
-        - Thomann category links are not always literally ending in ".html" in the HTML
-          (sometimes they have query params or anchors). If we use a strict CSS selector
-          like a[href$=".html"], we miss many links.
-        - On the seed page, subcategory anchor text often contains counts like "(123)"
-          which breaks exact allowlist matching.
-
         Strategy:
-        - Always collect anchors broadly (a::attr(href)), then decide based on the parsed URL path.
-        - depth 0 (seed): strict allowlist based on cleaned anchor text
-          (with trailing "(123)" removed).
-        - depth 1/2: broader discovery using a microphone-related keyword allowlist on the URL.
-        - Stop expanding once caller enforces max_category_depth.
+        - Iterate over <a> elements, not just href strings.
+        - depth 0 (seed): strict allowlist based on normalized anchor label text.
+        - depth 1/2: broader discovery using microphone-related keyword allowlist on the URL.
+        - Hard exclude accessory/parts categories based on both URL path and label text.
         """
         out = []
+        current = strip_tracking(response.url)
 
-        hrefs = response.css("a::attr(href)").getall()
-        for href in hrefs:
+        BLOCKED_CATEGORY_PATH_KEYWORDS = {
+            "video-podcast", "blowouts",
+            "aktionen", "actie", "acties",
+            "b_stock", "b-stock",
+            "sale", "deals", "outlet",
+            "topseller",
+            "prodnews",
+            "bf_", "blackfriday",
+            "alle-producten-in-de-categorie",
+            "brand", "merken",
+        }
+
+        for a in response.css("a"):
+            href = a.attrib.get("href")
             if not href:
                 continue
 
@@ -585,41 +839,46 @@ class ThomannProductsSpider(scrapy.Spider):
             if not should_follow_url(u):
                 continue
 
-            # Category pages should be ".html" (products are ".htm")
             path = (urlparse(u).path or "").lower()
             if (not path.endswith(".html")) or path.endswith(".htm"):
                 continue
 
-            # Read anchor text (seed matching + exclusion)
-            # I use "normalize-space" so I don't get empty strings due to formatting nodes.
-            text = clean(response.xpath(f'normalize-space(//a[@href="{href}"])').get())
+            if u == current:
+                continue
+
+            if depth > 0 and path.endswith("microfoons.html"):
+                continue
+
+            if any(k in path for k in BLOCKED_CATEGORY_PATH_KEYWORDS):
+                continue
+
+            if depth > 0 and re.search(r"_[a-z0-9]+_microfoons?", path):
+                continue
+
+            text = clean(" ".join(a.css("::text").getall()))
             label_norm = normalize_category_label(text)
 
-            # Hard exclusion: never crawl accessory / parts categories
-            # I check both URL path and label, because accessory pages often appear via label text.
             if any(x in path for x in EXCLUDED_CATEGORY_KEYWORDS) or any(x in label_norm for x in EXCLUDED_CATEGORY_KEYWORDS):
                 continue
 
             if depth == 0:
-                # Strict selection on seed page so we stay inside the Microphones tree,
-                # but with normalization so small label differences don't break it.
                 if label_norm in ALLOWED_SUBCATEGORY_NAMES_SEED_NORM:
                     out.append(u)
                 continue
 
-            # On deeper levels (depth 1 / 2), allow broader discovery,
-            # but still keep it microphone-related and still excluding accessories.
             u_low = u.lower()
-            if any(k in u_low for k in [
-                "microfoon", "microfoons", "mikro", "micro",
-                "zangmicro", "instrumentenmicro",
-                "condensator", "grootmembraan", "kleinmembraan",
-                "ribbon", "headset", "lavalier",
-                "usb", "podcast", "broadcast",
-                "zender", "video", "camera", "reporter",
-                "grensvlak", "installatie", "meetmicro",
-                "ovid",
-            ]):
+            if any(
+                k in u_low
+                for k in [
+                    "microfoon", "microfoons", "mikro", "micro",
+                    "zangmicro", "instrumentenmicro",
+                    "condensator", "grootmembraan", "kleinmembraan",
+                    "ribbon", "headset", "lavalier",
+                    "usb", "podcast", "broadcast",
+                    "zender", "video", "camera", "reporter",
+                    "grensvlak", "installatie", "meetmicro", "ovid",
+                ]
+            ):
                 out.append(u)
 
         return list(dict.fromkeys(out))
@@ -673,7 +932,7 @@ class ThomannProductsSpider(scrapy.Spider):
             "canonical_name": None,
         }
 
-        # First: stable listing_id from Thomann article number
+        # Stable listing_id from Thomann article number
         item["listing_id"] = extract_listing_id_from_html(response.text)
 
         # Parse JSON-LD blocks (Product + BreadcrumbList)
@@ -754,7 +1013,14 @@ class ThomannProductsSpider(scrapy.Spider):
                 item["rating_value"] = clean(agg.get("ratingValue"))
                 item["review_count"] = clean(agg.get("reviewCount") or agg.get("ratingCount"))
 
-        # Extract breadcrumb/category info from BreadcrumbList JSON-LD
+        # Final availability extraction (HTML-verified)
+        stock_text, in_stock = extract_stock_from_html(response)
+        if stock_text and not item["stock_status_text"]:
+            item["stock_status_text"] = stock_text
+        if item["in_stock"] is None and in_stock is not None:
+            item["in_stock"] = in_stock
+
+        # Breadcrumb/category info from BreadcrumbList JSON-LD
         if breadcrumb_ld and isinstance(breadcrumb_ld.get("itemListElement"), list):
             names = []
             urls = []
@@ -779,7 +1045,20 @@ class ThomannProductsSpider(scrapy.Spider):
                 if len(cat_candidates) >= 2:
                     item["breadcrumb_parent"] = cat_candidates[-2][0]
 
-        # HTML fallbacks for core fields (in case JSON-LD is missing)
+        # Microdata + HTML breadcrumb fallbacks
+        if not item["breadcrumb_category"] or not item["breadcrumb_url"]:
+            cat, cat_url, parent = extract_breadcrumb_from_microdata(response)
+            item["breadcrumb_category"] = item["breadcrumb_category"] or cat
+            item["breadcrumb_url"] = item["breadcrumb_url"] or cat_url
+            item["breadcrumb_parent"] = item["breadcrumb_parent"] or parent
+
+        if not item["breadcrumb_category"] or not item["breadcrumb_url"]:
+            cat, cat_url, parent = extract_breadcrumb_from_html(response)
+            item["breadcrumb_category"] = item["breadcrumb_category"] or cat
+            item["breadcrumb_url"] = item["breadcrumb_url"] or cat_url
+            item["breadcrumb_parent"] = item["breadcrumb_parent"] or parent
+
+        # HTML fallbacks for core fields (if JSON-LD is missing)
         if not item["title"]:
             item["title"] = (
                 clean(response.css("h1::text").get())
@@ -796,72 +1075,45 @@ class ThomannProductsSpider(scrapy.Spider):
                 or clean(response.css('meta[property="og:description"]::attr(content)').get())
             )
 
-        # Price fallbacks: meta tags -> buybox block (avoid full body scan)
+        # Price fallbacks: meta tags -> buybox current price (avoid full body scan)
         if item["current_price"] is None:
             p, ptxt = extract_price_from_meta(response)
             if p is not None:
                 item["current_price"] = p
                 item["price_text"] = item["price_text"] or ptxt
 
+        buybox_cur = None
         if item["current_price"] is None:
-            cur, base = extract_price_from_buybox(response)
-            item["current_price"] = cur
-            item["base_price"] = base
+            buybox_cur = extract_price_from_buybox(response)
+            item["current_price"] = buybox_cur
+
+        self.logger.info(
+            "BUYBOX PRICE DEBUG | %s | buybox_cur=%r | final_current=%r final_base=%r",
+            response.url,
+            buybox_cur,
+            item["current_price"],
+            item["base_price"],
+        )
+
+        # Thomann-specific discount reference: 30-Day Best Price
+        # Only use as base_price if it is actually higher than current_price.
+        if item["base_price"] is None:
+            ref30 = extract_reference_price_30day(response)
+            if ref30 is not None and item["current_price"] is not None:
+                if ref30 > item["current_price"]:
+                    item["base_price"] = ref30
+                else:
+                    self.logger.info(
+                        "REF30 IGNORED (<= current) | %s | ref30=%r current=%r",
+                        response.url, ref30, item["current_price"]
+                    )
 
         # Discount derived from base/current when possible
         if item["base_price"] is not None and item["current_price"] is not None:
-            if item["base_price"] >= item["current_price"]:
+            if item["base_price"] > item["current_price"]:
                 item["discount_amount"] = round(item["base_price"] - item["current_price"], 2)
                 if item["base_price"] > 0:
                     item["discount_percent"] = round((item["discount_amount"] / item["base_price"]) * 100, 2)
-
-        # Availability fallback using script-free text only
-        if not item["stock_status_text"] or item["in_stock"] is None:
-            safe_text = clean(" ".join(response.css("body *:not(script):not(style)::text").getall())) or ""
-            snippet, instock = detect_availability_from_text(safe_text)
-            if not item["stock_status_text"]:
-                item["stock_status_text"] = snippet
-            if item["in_stock"] is None:
-                item["in_stock"] = instock
-
-        # Rating fallback using script-free text only
-        if not item["rating_value"] or not item["review_count"]:
-            safe_text = clean(" ".join(response.css("body *:not(script):not(style)::text").getall())) or ""
-            if not item["rating_value"]:
-                m = re.search(r"(\d(?:[.,]\d)?)\s+van\s+de\s+5\s+sterren", safe_text, flags=re.IGNORECASE)
-                if m:
-                    item["rating_value"] = m.group(1).replace(",", ".")
-            if not item["review_count"]:
-                m = re.search(r"\((\d{1,7})\)", safe_text)
-                if m:
-                    item["review_count"] = m.group(1)
-
-        # Identifier fallbacks using script-free text
-        if not item["gtin"] or not item["mpn"] or not item["model"]:
-            safe_text = clean(" ".join(response.css("body *:not(script):not(style)::text").getall())) or ""
-
-            if not item["gtin"]:
-                m = re.search(r"\b(EAN|GTIN)\b\D{0,30}(\d{8,14})\b", safe_text, re.IGNORECASE)
-                if m:
-                    item["gtin"] = m.group(2)
-
-            if not item["mpn"]:
-                m = re.search(
-                    r"\b(MPN|Part number|Onderdeelnummer)\b\D{0,30}([A-Z0-9][A-Z0-9\-_\/\.]{2,})",
-                    safe_text,
-                    re.IGNORECASE,
-                )
-                if m:
-                    item["mpn"] = m.group(2)
-
-            if not item["model"]:
-                m = re.search(
-                    r"\b(Model|Modelnummer|Typenummer)\b\D{0,30}([A-Z0-9][A-Z0-9\-_\/\.]{2,})",
-                    safe_text,
-                    re.IGNORECASE,
-                )
-                if m:
-                    item["model"] = m.group(2)
 
         # Final normalization + matching helper field
         item["model"] = normalize_bad_model(item["model"])
