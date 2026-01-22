@@ -23,9 +23,10 @@ import scrapy
 from scrapy.http import HtmlResponse
 
 
-# Micro keyword traversal guard.
+# Keywords to identify microphone-related content
 MICRO_KEYWORDS = {"micro", "microfoon", "mic", "microphone", "microphones"}
 
+# Priority categories for microphone products
 PRIORITY_CATEGORY_KEYWORDS = [
     "studiomicrofoons",
     "live-microfoons",
@@ -40,6 +41,7 @@ PRIORITY_CATEGORY_KEYWORDS = [
     "installatiemicrofoons",
 ]
 
+# Accessory segments to skip (not main products)
 ACCESSORY_SEGMENTS = {
     "audiokabel-per-meter-rol",
     "beltpack-kabels-connectoren",
@@ -72,6 +74,7 @@ ACCESSORY_SEGMENTS = {
 }
 
 
+# Non-product path segments to avoid
 NON_PRODUCT_PATH_SEGMENTS = {
     "aanbiedingen",
     "b-stock-aanbiedingen",
@@ -79,6 +82,7 @@ NON_PRODUCT_PATH_SEGMENTS = {
     "top-10",
 }
 
+# Possible URL keys for product links
 PRODUCT_URL_KEYS = {
     "url",
     "producturl",
@@ -92,142 +96,164 @@ PRODUCT_URL_KEYS = {
 }
 
 
-# helpers
-def clean(text):
+# Helper functions for data cleaning and processing
+
+def clean_text(text):
+    """Clean and normalize text by removing extra whitespace."""
     if text is None:
         return None
-    s = re.sub(r"\s+", " ", str(text)).strip()
-    return s or None
+    cleaned = re.sub(r"\s+", " ", str(text)).strip()
+    return cleaned or None
 
 
-def price_to_float(text):
-    if not text:
+def convert_price_to_float(price_text):
+    """Convert price text to float, handling various formats."""
+    if not price_text:
         return None
-    t = re.sub(r"[^\d,\.]", "", str(text))
-    if not t:
+    # Remove non-numeric characters except dots and commas
+    cleaned = re.sub(r"[^\d,\.]", "", str(price_text))
+    if not cleaned:
         return None
-    if "," in t and "." in t:
-        # 1.234,56 -> 1234.56
-        t = t.replace(".", "").replace(",", ".")
-    elif "," in t:
-        t = t.replace(".", "").replace(",", ".")
-    elif "." in t:
-        # Treat dot as thousands if it looks like 1.234 or 12.345.678
-        if re.match(r"^\d{1,3}(?:\.\d{3})+$", t):
-            t = t.replace(".", "")
+    # Handle European format (comma as decimal)
+    if "," in cleaned and "." in cleaned:
+        # e.g., 1.234,56 -> 1234.56
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "." in cleaned:
+        # If dot looks like thousands separator, remove it
+        if re.match(r"^\d{1,3}(?:\.\d{3})+$", cleaned):
+            cleaned = cleaned.replace(".", "")
     try:
-        return float(t)
+        return float(cleaned)
     except ValueError:
         return None
 
 
-def text_has_any(text, words):
-    t = (text or "").lower()
-    return any(w.lower() in t for w in words)
+def text_contains_any(text, keywords):
+    """Check if text contains any of the keywords (case-insensitive)."""
+    if not text:
+        return False
+    lower_text = (text or "").lower()
+    return any(keyword.lower() in lower_text for keyword in keywords)
 
 
-def iter_json_ld(obj):
+def iterate_json_ld_objects(obj):
+    """Recursively iterate through JSON-LD objects."""
     if isinstance(obj, dict):
         yield obj
-        g = obj.get("@graph")
-        if isinstance(g, list):
-            for x in g:
-                yield from iter_json_ld(x)
+        graph = obj.get("@graph")
+        if isinstance(graph, list):
+            for item in graph:
+                yield from iterate_json_ld_objects(item)
     elif isinstance(obj, list):
-        for x in obj:
-            yield from iter_json_ld(x)
+        for item in obj:
+            yield from iterate_json_ld_objects(item)
 
 
-def canonicalize(brand, title, model=None):
-    parts = [clean(brand), clean(title), clean(model)]
-    parts = [p for p in parts if p]
+def create_canonical_name(brand, title, model=None):
+    """Create a canonical name by combining brand, title, and model."""
+    parts = [clean_text(brand), clean_text(title), clean_text(model)]
+    parts = [part for part in parts if part]
     if not parts:
         return None
-    s = " ".join(parts).lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s or None
+    combined = " ".join(parts).lower()
+    # Remove non-alphanumeric characters
+    combined = re.sub(r"[^a-z0-9]+", " ", combined)
+    combined = re.sub(r"\s+", " ", combined).strip()
+    return combined or None
 
 
-def meta_content(response, *names):
-    for n in names:
-        v = response.css(f'meta[property="{n}"]::attr(content)').get()
-        if v:
-            return clean(v)
-        v = response.css(f'meta[name="{n}"]::attr(content)').get()
-        if v:
-            return clean(v)
+def get_meta_content(response, *property_names):
+    """Extract content from meta tags."""
+    for prop in property_names:
+        content = response.css(f'meta[property="{prop}"]::attr(content)').get()
+        if content:
+            return clean_text(content)
+        content = response.css(f'meta[name="{prop}"]::attr(content)').get()
+        if content:
+            return clean_text(content)
     return None
 
 
-def pick_first_price_text(texts):
-    for t in texts:
-        t = clean(t)
-        if not t:
+def pick_first_price_text(price_texts):
+    """Pick the first text that looks like a price."""
+    for text in price_texts:
+        cleaned = clean_text(text)
+        if not cleaned:
             continue
-        if "€" in t or re.search(r"\b\d+[,.]\d{2}\b", t):
-            return t
+        if "€" in cleaned or re.search(r"\b\d+[,.]\d{2}\b", cleaned):
+            return cleaned
     return None
 
 
 def looks_like_price_text(text):
+    """Check if text resembles a price."""
     if not text:
         return False
-    t = clean(text) or ""
-    if "€" in t:
+    cleaned = clean_text(text) or ""
+    if "€" in cleaned:
         return True
-    if re.search(r"\b(?:eur|euro)\b", t, re.IGNORECASE):
+    if re.search(r"\b(?:eur|euro)\b", cleaned, re.IGNORECASE):
         return True
-    return bool(re.search(r"\b\d{1,3}(?:[.\s]\d{3})*,\d{2}\b", t))
+    return bool(re.search(r"\b\d{1,3}(?:[.\s]\d{3})*,\d{2}\b", cleaned))
 
 
-def normalize_bad_model(model):
-    m = clean(model)
-    if not m:
+def normalize_model_name(model):
+    """Normalize and validate model name."""
+    cleaned = clean_text(model)
+    if not cleaned:
         return None
 
-    low = m.lower()
-    if low in {"ditiontype", "editiontype", "conditiontype"}:
+    lower_cleaned = cleaned.lower()
+    # Remove invalid model names
+    if lower_cleaned in {"ditiontype", "editiontype", "conditiontype"}:
         return None
-    if len(m) > 30 and " " in m:
+    if len(cleaned) > 30 and " " in cleaned:
         return None
-    if len(m) < 2:
+    if len(cleaned) < 2:
         return None
-    return m
+    return cleaned
 
 
-def strip_tracking(url: str) -> str:
+def strip_tracking_parameters(url):
+    """Remove tracking parameters from URL."""
     try:
-        p = urlparse(url)
-        q = parse_qs(p.query)
-        for k in list(q.keys()):
-            if k.lower() in {"utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "ref"}:
-                q.pop(k, None)
-        new_query = urlencode(q, doseq=True)
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        # Remove common tracking parameters
+        tracking_params = {"utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "ref"}
+        for param in list(query.keys()):
+            if param.lower() in tracking_params:
+                query.pop(param, None)
+        new_query = urlencode(query, doseq=True)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
     except Exception:
         return url
 
 
-def slug_to_label(slug: str) -> str | None:
+def slug_to_label(slug):
+    """Convert URL slug to human-readable label."""
     if not slug:
         return None
     label = slug.replace("-", " ").replace("_", " ")
-    return clean(label)
+    return clean_text(label)
 
 
-def safe_filename_from_url(url: str) -> str:
-    p = urlparse(url)
-    slug = p.path.strip("/") or "root"
+def safe_filename_from_url(url):
+    """Create a safe filename from URL for debugging."""
+    parsed = urlparse(url)
+    slug = parsed.path.strip("/") or "root"
     slug = slug.replace("/", "__")
     slug = re.sub(r"[^a-zA-Z0-9_.-]", "_", slug)
     return f"{slug}.html"
 
 
-def breadcrumbs_from_url(url: str) -> tuple[list[str], list[str]]:
+def extract_breadcrumbs_from_url(url):
+    """Extract breadcrumb labels and URLs from URL path."""
     try:
-        p = urlparse(url)
-        parts = [x for x in p.path.split("/") if x]
+        parsed = urlparse(url)
+        parts = [part for part in parsed.path.split("/") if part]
         if not parts:
             return [], []
         if parts[-1].endswith(".html"):
@@ -243,181 +269,196 @@ def breadcrumbs_from_url(url: str) -> tuple[list[str], list[str]]:
             if not label:
                 continue
             path = "/" + "/".join(category_parts[: i + 1])
-            urls.append(strip_tracking(urlunparse((p.scheme, p.netloc, path, "", "", ""))))
+            urls.append(strip_tracking_parameters(urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))))
             labels.append(label)
         return labels, urls
     except Exception:
         return [], []
 
 
-def looks_like_product_url(url: str) -> bool:
+def is_product_url(url):
+    """Check if URL looks like a product page."""
     if not url:
         return False
-    p = urlparse(url)
-    parts = [x for x in p.path.split("/") if x]
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
     return len(parts) >= 2
 
 
-def should_follow_url(url: str) -> bool:
+def should_follow_url(url):
+    """Check if URL should be followed (not blocked)."""
     if not url:
         return False
-    u = url.lower()
-    if "/blog/" in u:
+    lower_url = url.lower()
+    blocked_patterns = [
+        "/blog/", "/wishlist", "/checkout", "/basket", "/login", "/account"
+    ]
+    if any(pattern in lower_url for pattern in blocked_patterns):
         return False
-    if any(x in u for x in ["/notify-product-in-stock/", "/wishlist", "/checkout", "/basket", "/login", "/account"]):
-        return False
-    if re.search(r"\.(pdf|zip|jpe?g|png|svg)$", urlparse(u).path):
+    if re.search(r"\.(pdf|zip|jpe?g|png|svg)$", urlparse(lower_url).path):
         return False
     return True
 
 
-def has_accessory_segment(url: str) -> bool:
+def has_accessory_segment(url):
+    """Check if URL contains accessory segments."""
     if not url:
         return False
     path = urlparse(url).path.lower()
-    for seg in [p for p in path.split("/") if p]:
-        if seg in ACCESSORY_SEGMENTS:
+    for segment in [part for part in path.split("/") if part]:
+        if segment in ACCESSORY_SEGMENTS:
             return True
     return False
 
 
-def is_allowed_category_url(url: str) -> bool:
+def is_allowed_category_url(url):
+    """Check if URL is an allowed category page."""
     if not url:
         return False
     path = urlparse(url).path.lower()
-    parts = [x for x in path.split("/") if x]
-    if any(seg in NON_PRODUCT_PATH_SEGMENTS for seg in parts):
+    parts = [part for part in path.split("/") if part]
+    if any(segment in NON_PRODUCT_PATH_SEGMENTS for segment in parts):
         return False
     return bool(parts)
 
 
-def is_probable_product_url(url: str, require_category_keyword: bool = True) -> bool:
+def is_probable_product_url(url, require_micro_keyword=True):
+    """Check if URL is likely a product page."""
     if not url:
         return False
     if not should_follow_url(url):
         return False
     path = urlparse(url).path.lower()
-    parts = [x for x in path.split("/") if x]
-    min_parts = 1
-    if len(parts) < min_parts:
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 1:
         return False
-    if any(seg in NON_PRODUCT_PATH_SEGMENTS for seg in parts):
+    if any(segment in NON_PRODUCT_PATH_SEGMENTS for segment in parts):
         return False
-    if require_category_keyword and not any(kw in path for kw in MICRO_KEYWORDS):
+    if require_micro_keyword and not any(keyword in path for keyword in MICRO_KEYWORDS):
         return False
     if has_accessory_segment(url):
         return False
     return True
 
 
-
-
-def category_priority(url: str) -> int:
+def get_category_priority(url):
+    """Get priority score for category URL."""
     if not url:
         return 0
     path = urlparse(url).path.lower()
-    for idx, kw in enumerate(PRIORITY_CATEGORY_KEYWORDS):
-        if kw in path:
+    for idx, keyword in enumerate(PRIORITY_CATEGORY_KEYWORDS):
+        if keyword in path:
             return 100 - (idx * 10)
     return 0
 
 
-def listing_url_allowed(url: str) -> bool:
+def is_listing_url_allowed(url):
+    """Check if listing URL is allowed."""
     if not url:
         return False
     if not should_follow_url(url):
         return False
     path = urlparse(url).path.lower()
-    parts = [seg for seg in path.split("/") if seg]
+    parts = [segment for segment in path.split("/") if segment]
     if not parts:
         return False
-    if any(seg in NON_PRODUCT_PATH_SEGMENTS for seg in parts):
+    if any(segment in NON_PRODUCT_PATH_SEGMENTS for segment in parts):
         return False
     if has_accessory_segment(url):
         return False
     return True
 
 
+# Sitemap URLs
 MICROPHONES_SITEMAP_URL = "https://sitemap.bax-shop.nl/nl_nl/sitemap-microfoons.xml"
 NL_NL_SITEMAP_URL = "https://sitemap.bax-shop.nl/nl_nl/sitemap.xml"
 
 
-def get_git_commit_hash() -> str | None:
+def get_git_commit_hash():
+    """Get current git commit hash."""
     try:
-        out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
-        return out.decode("utf-8", errors="ignore").strip() or None
+        result = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
+        return result.decode("utf-8", errors="ignore").strip() or None
     except Exception:
         return None
 
 
-def parse_discount_percent(text: str) -> float | None:
+def parse_discount_percentage(text):
+    """Parse discount percentage from text."""
     if not text:
         return None
-    m = re.search(r"(\d{1,2})\s*%\s*(korting|discount)", text, re.IGNORECASE)
-    if m:
+    match = re.search(r"(\d{1,2})\s*%\s*(korting|discount)", text, re.IGNORECASE)
+    if match:
         try:
-            return float(m.group(1))
+            return float(match.group(1))
         except Exception:
             return None
     return None
 
 
-def extract_prices_from_buyblock_text(full_text: str):
+def extract_prices_from_buy_block(full_text):
+    """Extract current and base prices from buy block text."""
     if not full_text:
         return None, None
 
+    # Find price-like strings
     candidates = re.findall(r"€\s*\d[\d\.\s]*[,\.\d]{0,3}\d", full_text)
     if not candidates:
         candidates = re.findall(r"\b\d[\d\.\s]*[,\.\d]{0,3}\d\b", full_text)
 
-    vals = []
-    for c in candidates:
-        v = price_to_float(c)
-        if v is not None:
-            vals.append(v)
+    prices = []
+    for candidate in candidates:
+        price = convert_price_to_float(candidate)
+        if price is not None:
+            prices.append(price)
 
-    if not vals:
+    if not prices:
         return None, None
 
-    current = vals[0]
-    base = vals[1] if len(vals) > 1 else None
+    current_price = prices[0]
+    base_price = prices[1] if len(prices) > 1 else None
 
-    if len(vals) >= 2:
-        current2 = min([x for x in vals if x > 0], default=current)
-        base2 = max([x for x in vals if x > 0], default=base or current)
-        if base2 >= current2:
-            current, base = current2, base2
+    if len(prices) >= 2:
+        # Prefer lower price as current if base is higher
+        current_price_alt = min([p for p in prices if p > 0], default=current_price)
+        base_price_alt = max([p for p in prices if p > 0], default=base_price or current_price)
+        if base_price_alt >= current_price_alt:
+            current_price, base_price = current_price_alt, base_price_alt
 
-    return current, base
+    return current_price, base_price
 
 
-def extract_itemlist_urls(nodes, only_product: bool = False):
+def extract_itemlist_urls(nodes, only_products=False):
+    """Extract URLs from JSON-LD ItemList objects."""
     urls = []
-    for n in nodes:
-        t = n.get("@type")
-        if t == "ItemList" or (isinstance(t, list) and "ItemList" in t):
-            els = n.get("itemListElement")
-            if not isinstance(els, list):
+    for node in nodes:
+        node_type = node.get("@type")
+        if node_type == "ItemList" or (isinstance(node_type, list) and "ItemList" in node_type):
+            elements = node.get("itemListElement")
+            if not isinstance(elements, list):
                 continue
-            for el in els:
-                if isinstance(el, dict):
-                    url = el.get("url")
-                    item = el.get("item")
-                    el_type = el.get("@type")
+            for element in elements:
+                if isinstance(element, dict):
+                    url = element.get("url")
+                    item = element.get("item")
+                    element_type = element.get("@type")
                     if not url and isinstance(item, dict):
                         url = item.get("url") or item.get("@id")
 
-                    if only_product:
-                        item_type = None
+                    if only_products:
+                        item_types = []
                         if isinstance(item, dict):
                             item_type = item.get("@type")
-                        types = []
-                        for v in (el_type, item_type):
-                            if isinstance(v, list):
-                                types.extend(v)
-                            elif isinstance(v, str):
-                                types.append(v)
-                        if not any(t == "Product" for t in types):
+                            if isinstance(item_type, list):
+                                item_types.extend(item_type)
+                            elif isinstance(item_type, str):
+                                item_types.append(item_type)
+                        element_types = []
+                        if isinstance(element_type, list):
+                            element_types.extend(element_type)
+                        elif isinstance(element_type, str):
+                            element_types.append(element_type)
+                        if not any(t == "Product" for t in item_types + element_types):
                             continue
 
                     if isinstance(url, str):
@@ -426,99 +467,110 @@ def extract_itemlist_urls(nodes, only_product: bool = False):
 
 
 def extract_product_urls(nodes):
+    """Extract product URLs from JSON-LD Product objects."""
     urls = []
-    for n in nodes:
-        t = n.get("@type")
-        if t == "Product" or (isinstance(t, list) and "Product" in t):
-            url = n.get("url") or n.get("@id")
+    for node in nodes:
+        node_type = node.get("@type")
+        if node_type == "Product" or (isinstance(node_type, list) and "Product" in node_type):
+            url = node.get("url") or node.get("@id")
             if isinstance(url, str):
                 urls.append(url)
     return urls
 
 
-def extract_urls_from_json(data):
+def extract_urls_from_json_data(data):
+    """Extract URLs from arbitrary JSON data."""
     urls = []
     if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, str):
-                key = (k or "").lower()
-                if key in PRODUCT_URL_KEYS or key.endswith("url") or key.endswith("href"):
-                    urls.append(v)
-            elif isinstance(v, (dict, list)):
-                urls.extend(extract_urls_from_json(v))
+        for key, value in data.items():
+            if isinstance(value, str):
+                lower_key = (key or "").lower()
+                if lower_key in PRODUCT_URL_KEYS or lower_key.endswith("url") or lower_key.endswith("href"):
+                    urls.append(value)
+            elif isinstance(value, (dict, list)):
+                urls.extend(extract_urls_from_json_data(value))
     elif isinstance(data, list):
-        for v in data:
-            urls.extend(extract_urls_from_json(v))
+        for item in data:
+            urls.extend(extract_urls_from_json_data(item))
     return urls
 
 
 def extract_script_json_urls(response):
+    """Extract URLs from JSON scripts in the page."""
     urls = []
     scripts = response.css(
         'script[type="application/json"]::text, '
         'script#__NEXT_DATA__::text, '
         'script#__NUXT__::text'
     ).getall()
-    for s in scripts:
-        t = (s or "").strip()
-        if not t:
+    for script in scripts:
+        cleaned_script = (script or "").strip()
+        if not cleaned_script:
             continue
-        if t.startswith("window.__NUXT__=") or t.startswith("window.__INITIAL_STATE__="):
-            t = t.split("=", 1)[1].strip()
-            if t.endswith(";"):
-                t = t[:-1].strip()
+        if cleaned_script.startswith("window.__NUXT__=") or cleaned_script.startswith("window.__INITIAL_STATE__="):
+            cleaned_script = cleaned_script.split("=", 1)[1].strip()
+            if cleaned_script.endswith(";"):
+                cleaned_script = cleaned_script[:-1].strip()
         try:
-            data = json.loads(t)
+            data = json.loads(cleaned_script)
         except Exception:
             continue
-        urls.extend(extract_urls_from_json(data))
+        urls.extend(extract_urls_from_json_data(data))
     return urls
 
 
-def extract_spec_pairs(response) -> dict[str, str]:
-    pairs: dict[str, str] = {}
+def extract_product_specs(response):
+    """Extract product specifications from HTML."""
+    specs = {}
 
+    # From table rows
     for row in response.css("table tr"):
-        label = clean(" ".join(row.css("th::text, th *::text").getall()))
-        value = clean(" ".join(row.css("td::text, td *::text").getall()))
+        label = clean_text(" ".join(row.css("th::text, th *::text").getall()))
+        value = clean_text(" ".join(row.css("td::text, td *::text").getall()))
         if label and value:
-            pairs.setdefault(label.lower(), value)
+            specs.setdefault(label.lower(), value)
 
+    # From definition lists
     for dl in response.css("dl"):
         dts = dl.css("dt")
         dds = dl.css("dd")
         for i in range(min(len(dts), len(dds))):
-            label = clean(" ".join(dts[i].css("*::text").getall()))
-            value = clean(" ".join(dds[i].css("*::text").getall()))
+            label = clean_text(" ".join(dts[i].css("*::text").getall()))
+            value = clean_text(" ".join(dds[i].css("*::text").getall()))
             if label and value:
-                pairs.setdefault(label.lower(), value)
+                specs.setdefault(label.lower(), value)
 
+    # From list items
     for li in response.css("li"):
-        text = clean(" ".join(li.css("*::text").getall()))
+        text = clean_text(" ".join(li.css("*::text").getall()))
         if not text or ":" not in text:
             continue
         label, value = text.split(":", 1)
-        label = clean(label)
-        value = clean(value)
+        label = clean_text(label)
+        value = clean_text(value)
         if label and value:
-            pairs.setdefault(label.lower(), value)
+            specs.setdefault(label.lower(), value)
 
-    return pairs
+    return specs
 
 
-def find_spec_value(pairs: dict[str, str], *keys: str) -> str | None:
-    for label, value in pairs.items():
+def find_spec_value(specs, *keys):
+    """Find specification value by key."""
+    for label, value in specs.items():
         for key in keys:
             if key in label:
                 return value
     return None
 
 
-# spider
+# Main spider class
 class BaxProductsSpider(scrapy.Spider):
+    """Spider for scraping Bax Music microphone products."""
+
     name = "bax_products"
     allowed_domains = ["bax-shop.nl"]
 
+    # Starting URLs for categories
     start_urls = [
         "https://www.bax-shop.nl/microfoons",
         "https://www.bax-shop.nl/dynamische-microfoons",
@@ -530,8 +582,10 @@ class BaxProductsSpider(scrapy.Spider):
         "https://www.bax-shop.nl/microfoon-opnamesets",
     ]
 
+    # Maximum depth for category exploration
     DEFAULT_MAX_CATEGORY_DEPTH = 8
 
+    # Scrapy settings
     custom_settings = {
         "ROBOTSTXT_OBEY": True,
         "DOWNLOAD_DELAY": 2,
@@ -549,10 +603,12 @@ class BaxProductsSpider(scrapy.Spider):
         "CLOSESPIDER_TIMEOUT": 36000,
     }
 
+    # Version identifier
     crawler_version = "bax_products/RAW-1.0"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Generate unique run ID
         self.scrape_run_id = str(uuid.uuid4())
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.git_commit_hash = get_git_commit_hash()
@@ -560,6 +616,7 @@ class BaxProductsSpider(scrapy.Spider):
             self.max_category_depth = int(kwargs.get("max_depth", self.DEFAULT_MAX_CATEGORY_DEPTH))
         except ValueError:
             self.max_category_depth = self.DEFAULT_MAX_CATEGORY_DEPTH
+        # Debug dump settings
         self.debug_dump_dir = os.getenv("BAX_DEBUG_DIR")
         self.debug_dump_count = 0
         try:
@@ -568,12 +625,15 @@ class BaxProductsSpider(scrapy.Spider):
             self.debug_dump_limit = 3
         if self.debug_dump_dir:
             Path(self.debug_dump_dir).expanduser().mkdir(parents=True, exist_ok=True)
+        # Selenium settings
         self.use_selenium = os.getenv("USE_SELENIUM", "0").lower() in {"1", "true", "yes", "on"}
         self._selenium_driver = None
         self._selenium_warned = False
-        self._seen_sitemaps: set[str] = set()
+        # Track seen sitemaps
+        self._seen_sitemaps = set()
 
     def _dump_listing_html(self, response):
+        """Dump HTML for debugging if enabled."""
         if not self.debug_dump_dir:
             return
         if self.debug_dump_count >= self.debug_dump_limit:
@@ -588,6 +648,7 @@ class BaxProductsSpider(scrapy.Spider):
             self.logger.warning("FAILED TO DUMP LISTING HTML url=%s err=%s", response.url, exc)
 
     def start_requests(self):
+        """Initialize the crawl by yielding initial requests."""
         # Emit run metadata once
         yield {
             "type": "run",
@@ -598,16 +659,18 @@ class BaxProductsSpider(scrapy.Spider):
             "notes": "bax microphones crawl",
         }
 
+        # Start from category URLs
         for url in self.start_urls:
             yield scrapy.Request(url, callback=self.parse, meta={"category_depth": 0, "category_priority": 0})
 
+        # Parse sitemaps
         yield scrapy.Request(
             "https://www.bax-shop.nl/sitemap.xml",
             callback=self.parse_sitemap,
             meta={"category_depth": 0, "category_priority": 0},
         )
 
-        # Targeted sitemap feed for the Microfoons section.
+        # Targeted sitemap for microphones
         yield scrapy.Request(
             MICROPHONES_SITEMAP_URL,
             callback=self.parse_sitemap,
@@ -620,36 +683,41 @@ class BaxProductsSpider(scrapy.Spider):
             meta={"category_depth": 0, "category_priority": 0},
         )
 
-    def sitemap_url_allowed(self, url: str) -> bool:
+    def sitemap_url_allowed(self, url):
+        """Check if sitemap URL should be processed."""
         if not url:
             return False
         path = urlparse(url).path.lower()
-        if any(seg in NON_PRODUCT_PATH_SEGMENTS for seg in path.split("/") if seg):
+        if any(segment in NON_PRODUCT_PATH_SEGMENTS for segment in path.split("/") if segment):
             return False
-        if not any(kw in path for kw in MICRO_KEYWORDS):
+        if not any(keyword in path for keyword in MICRO_KEYWORDS):
             return False
         return True
 
     def parse_sitemap(self, response):
+        """Parse XML sitemap and yield URLs."""
         if response.url in self._seen_sitemaps:
             return
         self._seen_sitemaps.add(response.url)
 
-        sitemaps = response.xpath("//*[local-name()='sitemap']/*[local-name()='loc']/text()").getall()
-        for loc in sitemaps:
-            loc = clean(loc)
+        # Find nested sitemaps
+        nested_sitemaps = response.xpath("//*[local-name()='sitemap']/*[local-name()='loc']/text()").getall()
+        for loc in nested_sitemaps:
+            loc = clean_text(loc)
             if not loc:
                 continue
             yield scrapy.Request(loc, callback=self.parse_sitemap)
 
+        # Find URLs
         urls = response.xpath("//*[local-name()='url']/*[local-name()='loc']/text()").getall()
         for loc in urls:
-            loc = clean(loc)
+            loc = clean_text(loc)
             if not loc or not self.sitemap_url_allowed(loc):
                 continue
             yield scrapy.Request(loc, callback=self.parse, meta={"category_depth": 0, "category_priority": 0})
 
     def parse(self, response):
+        """Parse listing or product page."""
         if self._should_render_with_selenium(response):
             selenium_response = self._render_with_selenium(response)
             if selenium_response:
@@ -660,30 +728,30 @@ class BaxProductsSpider(scrapy.Spider):
         category_depth = response.meta.get("category_depth", 0)
         category_priority_value = response.meta.get("category_priority", 0)
         allow_listing_expansion = category_depth < self.max_category_depth
-        source_url = strip_tracking(response.url)
+        source_url = strip_tracking_parameters(response.url)
 
-        # JSON-LD ItemList links (most reliable for product grids)
+        # Extract JSON-LD data
         blocks = response.css('script[type="application/ld+json"]::text').getall()
         nodes = []
-        for b in blocks:
-            b = (b or "").strip()
-            if not b:
+        for block in blocks:
+            block = (block or "").strip()
+            if not block:
                 continue
             try:
-                data = json.loads(b)
-                nodes.extend(iter_json_ld(data))
+                data = json.loads(block)
+                nodes.extend(iterate_json_ld_objects(data))
             except Exception:
                 continue
 
         product_nodes = []
-        for n in nodes:
-            t = n.get("@type")
-            if t == "Product" or (isinstance(t, list) and "Product" in t):
-                product_nodes.append(n)
+        for node in nodes:
+            node_type = node.get("@type")
+            if node_type == "Product" or (isinstance(node_type, list) and "Product" in node_type):
+                product_nodes.append(node)
 
         product_ld = product_nodes[0] if product_nodes else None
 
-        itemlist_product_urls = extract_itemlist_urls(nodes, only_product=True)
+        itemlist_product_urls = extract_itemlist_urls(nodes, only_products=True)
         product_tile_nodes = response.css(
             '[itemtype*="Product"], [data-product-id], [data-sku], [data-test*="product"], [data-testid*="product"]'
         )
@@ -693,7 +761,7 @@ class BaxProductsSpider(scrapy.Spider):
             .get()
         )
 
-        og_type = (meta_content(response, "og:type") or "").lower()
+        og_type = (get_meta_content(response, "og:type") or "").lower()
         has_price_meta = bool(response.css('[itemprop="price"], meta[property="product:price:amount"]').get())
         has_buybox = bool(response.css('form[action*="cart"], [data-test*="add-to-cart"]').get())
 
@@ -745,6 +813,7 @@ class BaxProductsSpider(scrapy.Spider):
             yield from self.parse_product(response)
             return
 
+        # Collect product links from various sources
         structured_links = []
         structured_links.extend(itemlist_product_urls)
         structured_links.extend(extract_product_urls(product_nodes))
@@ -779,13 +848,14 @@ class BaxProductsSpider(scrapy.Spider):
                 'a[href*="microfoons"]::attr(href)'
             ).getall()
 
-        structured_links = [strip_tracking(response.urljoin(h)) for h in structured_links if h]
-        structured_links = [u for u in structured_links if looks_like_product_url(u)]
-        structured_links = [u for u in structured_links if is_probable_product_url(u, require_category_keyword=False)]
+        # Clean and filter product links
+        structured_links = [strip_tracking_parameters(response.urljoin(href)) for href in structured_links if href]
+        structured_links = [url for url in structured_links if is_product_url(url)]
+        structured_links = [url for url in structured_links if is_probable_product_url(url, require_category_keyword=False)]
 
-        product_links = [strip_tracking(response.urljoin(h)) for h in product_links if h]
-        product_links = [u for u in product_links if looks_like_product_url(u)]
-        product_links = [u for u in product_links if is_probable_product_url(u)]
+        product_links = [strip_tracking_parameters(response.urljoin(href)) for href in product_links if href]
+        product_links = [url for url in product_links if is_product_url(url)]
+        product_links = [url for url in product_links if is_probable_product_url(url)]
 
         product_links.extend(structured_links)
         product_links = list(dict.fromkeys(product_links))
@@ -794,52 +864,56 @@ class BaxProductsSpider(scrapy.Spider):
             self.logger.info("NO PRODUCT LINKS url=%s", response.url)
             self._dump_listing_html(response)
 
+        # Yield requests for product pages
         for url in product_links:
             yield response.follow(url, callback=self.parse, priority=category_priority_value)
 
         if allow_listing_expansion:
-            listing_links = extract_itemlist_urls(nodes, only_product=False)
-            listing_links = [strip_tracking(response.urljoin(h)) for h in listing_links if h]
+            # Find sub-category links
+            listing_links = extract_itemlist_urls(nodes, only_products=False)
+            listing_links = [strip_tracking_parameters(response.urljoin(href)) for href in listing_links if href]
             listing_links = [
-                u
-                for u in listing_links
-                if should_follow_url(u)
-                and listing_url_allowed(u)
-                and u != response.url
-                and (category_priority(u) > 0 or any(kw in urlparse(u).path.lower() for kw in MICRO_KEYWORDS))
+                url
+                for url in listing_links
+                if should_follow_url(url)
+                and is_listing_url_allowed(url)
+                and url != response.url
+                and (get_category_priority(url) > 0 or any(keyword in urlparse(url).path.lower() for keyword in MICRO_KEYWORDS))
             ]
             listing_links = list(dict.fromkeys(listing_links))
 
-            listing_links = listing_links or response.css(
-                'a[href*="/microfoon"]::attr(href), '
-                'a[href*="/microfoons"]::attr(href), '
-                'a[data-test*="category"]::attr(href)'
-            ).getall()
-            if listing_links:
-                listing_links = [strip_tracking(response.urljoin(h)) for h in listing_links if h]
-                listing_links = [
-                    u
-                    for u in listing_links
-                    if should_follow_url(u)
-                    and listing_url_allowed(u)
-                    and u != response.url
-                    and u not in product_links
-                    and (category_priority(u) > 0 or any(kw in urlparse(u).path.lower() for kw in MICRO_KEYWORDS))
-                ]
-                listing_links = list(dict.fromkeys(listing_links))
+            if not listing_links:
+                listing_links = response.css(
+                    'a[href*="/microfoon"]::attr(href), '
+                    'a[href*="/microfoons"]::attr(href), '
+                    'a[data-test*="category"]::attr(href)'
+                ).getall()
+                if listing_links:
+                    listing_links = [strip_tracking_parameters(response.urljoin(href)) for href in listing_links if href]
+                    listing_links = [
+                        url
+                        for url in listing_links
+                        if should_follow_url(url)
+                        and is_listing_url_allowed(url)
+                        and url != response.url
+                        and url not in product_links
+                        and (get_category_priority(url) > 0 or any(keyword in urlparse(url).path.lower() for keyword in MICRO_KEYWORDS))
+                    ]
+                    listing_links = list(dict.fromkeys(listing_links))
 
+            # Yield requests for sub-categories
             for url in listing_links:
-                prio = category_priority(url)
+                priority = get_category_priority(url)
                 yield response.follow(
                     url,
                     callback=self.parse,
                     meta={"category_depth": category_depth + 1},
-                    priority=prio,
+                    priority=priority,
                 )
         else:
             self.logger.debug("MAX DEPTH reached skip listings url=%s depth=%s", response.url, category_depth)
 
-        # Pagination
+        # Handle pagination
         next_page = (
             response.css('a[rel="next"]::attr(href)').get()
             or response.css('a[aria-label*="Volgende"]::attr(href)').get()
@@ -855,22 +929,24 @@ class BaxProductsSpider(scrapy.Spider):
             )
             return
 
-        # Fallback ?page=
-        p = urlparse(response.url)
-        q = parse_qs(p.query)
-        if "page" in q:
+        # Fallback pagination with ?page=
+        parsed_url = urlparse(response.url)
+        query = parse_qs(parsed_url.query)
+        if "page" in query:
             try:
-                cur = int(q["page"][0])
-                q["page"] = [str(cur + 1)]
-                url2 = urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
-                yield response.follow(url2, callback=self.parse)
+                current_page = int(query["page"][0])
+                query["page"] = [str(current_page + 1)]
+                next_url = urlunparse((parsed_url.scheme, parsed_url.netloc, parsed_url.path, parsed_url.params, urlencode(query, doseq=True), parsed_url.fragment))
+                yield response.follow(next_url, callback=self.parse)
             except Exception:
                 pass
 
     def parse_product(self, response):
+        """Parse individual product page and yield product data."""
         scraped_at = datetime.now(timezone.utc).isoformat()
-        source_url = strip_tracking(response.url)
+        source_url = strip_tracking_parameters(response.url)
 
+        # Initialize product item with default values
         item = {
             "type": "product",
             "scrape_run_id": self.scrape_run_id,
@@ -878,7 +954,7 @@ class BaxProductsSpider(scrapy.Spider):
             "source_url": source_url,
             "seed_category": "microfoons",
 
-            # product identity
+            # Product identity
             "title": None,
             "brand": None,
             "model": None,
@@ -887,11 +963,11 @@ class BaxProductsSpider(scrapy.Spider):
             "mpn": None,
             "sku": None,
 
-            # content
+            # Content
             "description": None,
             "image_url": None,
 
-            # price snapshot
+            # Price snapshot
             "currency": "EUR",
             "current_price": None,
             "base_price": None,
@@ -901,19 +977,19 @@ class BaxProductsSpider(scrapy.Spider):
             "in_stock": None,
             "stock_status_text": None,
 
-            # review aggregate
+            # Review aggregate
             "rating_value": None,
             "rating_scale": 5,
             "review_count": None,
 
-            # breadcrumbs
+            # Breadcrumbs
             "breadcrumb_category": None,
             "breadcrumb_parent": None,
             "breadcrumb_url": None,
             "breadcrumb_path": None,
             "breadcrumb_urls": None,
 
-            # customer service (best-effort)
+            # Customer service (best-effort)
             "shipping_included": None,
             "free_shipping_threshold_amt": None,
             "pickup_point_available": None,
@@ -926,103 +1002,109 @@ class BaxProductsSpider(scrapy.Spider):
             "customer_service_url": None,
         }
 
-        # JSON-LD
+        # Extract JSON-LD data
         blocks = response.css('script[type="application/ld+json"]::text').getall()
         nodes = []
-        for b in blocks:
-            b = (b or "").strip()
-            if not b:
+        for block in blocks:
+            block = (block or "").strip()
+            if not block:
                 continue
             try:
-                data = json.loads(b)
-                nodes.extend(iter_json_ld(data))
+                data = json.loads(block)
+                nodes.extend(iterate_json_ld_objects(data))
             except Exception:
                 continue
 
         product_ld = None
         breadcrumb_ld = None
-        for n in nodes:
-            t = n.get("@type")
-            if t == "Product" or (isinstance(t, list) and "Product" in t):
-                product_ld = product_ld or n
-            if t == "BreadcrumbList" or (isinstance(t, list) and "BreadcrumbList" in t):
-                breadcrumb_ld = breadcrumb_ld or n
+        for node in nodes:
+            node_type = node.get("@type")
+            if node_type == "Product" or (isinstance(node_type, list) and "Product" in node_type):
+                product_ld = product_ld or node
+            if node_type == "BreadcrumbList" or (isinstance(node_type, list) and "BreadcrumbList" in node_type):
+                breadcrumb_ld = breadcrumb_ld or node
 
+        # Extract data from JSON-LD Product
         if product_ld:
-            item["title"] = clean(product_ld.get("name"))
-            item["description"] = clean(product_ld.get("description"))
+            item["title"] = clean_text(product_ld.get("name"))
+            item["description"] = clean_text(product_ld.get("description"))
 
             brand = product_ld.get("brand")
             if isinstance(brand, dict):
-                item["brand"] = clean(brand.get("name"))
+                item["brand"] = clean_text(brand.get("name"))
             elif isinstance(brand, str):
-                item["brand"] = clean(brand)
+                item["brand"] = clean_text(brand)
 
-            for k in ("gtin13", "gtin14", "gtin12", "gtin8", "gtin"):
-                v = product_ld.get(k)
-                if v:
-                    item["gtin"] = clean(v)
+            # GTIN variants
+            for gtin_key in ("gtin13", "gtin14", "gtin12", "gtin8", "gtin"):
+                value = product_ld.get(gtin_key)
+                if value:
+                    item["gtin"] = clean_text(value)
                     break
             if product_ld.get("mpn"):
-                item["mpn"] = clean(product_ld.get("mpn"))
+                item["mpn"] = clean_text(product_ld.get("mpn"))
             if product_ld.get("sku"):
-                item["sku"] = clean(product_ld.get("sku"))
+                item["sku"] = clean_text(product_ld.get("sku"))
 
             if product_ld.get("model"):
-                m = product_ld.get("model")
-                if isinstance(m, dict):
-                    item["model"] = clean(m.get("name") or m.get("model"))
+                model = product_ld.get("model")
+                if isinstance(model, dict):
+                    item["model"] = clean_text(model.get("name") or model.get("model"))
                 else:
-                    item["model"] = clean(m)
+                    item["model"] = clean_text(model)
 
-            img = product_ld.get("image")
-            if isinstance(img, list) and img:
-                item["image_url"] = clean(img[0])
-            elif isinstance(img, str):
-                item["image_url"] = clean(img)
+            # Image
+            image = product_ld.get("image")
+            if isinstance(image, list) and image:
+                item["image_url"] = clean_text(image[0])
+            elif isinstance(image, str):
+                item["image_url"] = clean_text(image)
 
+            # Offers/price
             offers = product_ld.get("offers")
             if isinstance(offers, list) and offers:
                 offers = offers[0]
             if isinstance(offers, dict):
-                p = offers.get("price")
-                if p is not None:
-                    item["price_text"] = clean(p)
-                    item["current_price"] = price_to_float(p)
+                price = offers.get("price")
+                if price is not None:
+                    item["price_text"] = clean_text(price)
+                    item["current_price"] = convert_price_to_float(price)
                 if offers.get("priceCurrency"):
-                    item["currency"] = clean(offers.get("priceCurrency"))
+                    item["currency"] = clean_text(offers.get("priceCurrency"))
 
-                av = offers.get("availability")
-                if isinstance(av, str):
-                    item["stock_status_text"] = av
-                    item["in_stock"] = ("InStock" in av)
+                availability = offers.get("availability")
+                if isinstance(availability, str):
+                    item["stock_status_text"] = availability
+                    item["in_stock"] = ("InStock" in availability)
 
-            agg = product_ld.get("aggregateRating")
-            if isinstance(agg, dict):
-                item["rating_value"] = clean(agg.get("ratingValue"))
-                item["review_count"] = clean(agg.get("reviewCount") or agg.get("ratingCount"))
+            # Aggregate rating
+            agg_rating = product_ld.get("aggregateRating")
+            if isinstance(agg_rating, dict):
+                item["rating_value"] = clean_text(agg_rating.get("ratingValue"))
+                item["review_count"] = clean_text(agg_rating.get("reviewCount") or agg_rating.get("ratingCount"))
 
-        # BreadcrumbList JSON-LD
+        # Extract breadcrumbs from JSON-LD
         breadcrumb_names = []
         breadcrumb_urls = []
         if breadcrumb_ld and isinstance(breadcrumb_ld.get("itemListElement"), list):
             names = []
             urls = []
-            for el in breadcrumb_ld["itemListElement"]:
-                if isinstance(el, dict):
-                    nm = el.get("name")
-                    it = el.get("item")
-                    names.append(clean(nm))
-                    urls.append(clean(it) if isinstance(it, str) else clean((it or {}).get("@id")))
-            for nm, u in zip(names, urls):
-                if not nm or not u:
+            for element in breadcrumb_ld["itemListElement"]:
+                if isinstance(element, dict):
+                    name = element.get("name")
+                    item_ref = element.get("item")
+                    names.append(clean_text(name))
+                    urls.append(clean_text(item_ref) if isinstance(item_ref, str) else clean_text((item_ref or {}).get("@id")))
+            for name, url in zip(names, urls):
+                if not name or not url:
                     continue
-                u = strip_tracking(u)
-                if u == source_url:
+                url = strip_tracking_parameters(url)
+                if url == source_url:
                     continue
-                breadcrumb_names.append(nm)
-                breadcrumb_urls.append(u)
+                breadcrumb_names.append(name)
+                breadcrumb_urls.append(url)
 
+        # Fallback breadcrumb extraction from HTML
         if not breadcrumb_names:
             crumb_texts = response.css(
                 'nav[aria-label*="breadcrumb"] a::text, '
@@ -1039,16 +1121,17 @@ class BaxProductsSpider(scrapy.Spider):
                 'a[data-test*="breadcrumb"]::attr(href)'
             ).getall()
 
-            crumb_texts = [clean(c) for c in crumb_texts if clean(c)]
-            crumb_hrefs = [strip_tracking(response.urljoin(h)) for h in crumb_hrefs if h]
-            for nm, u in zip(crumb_texts, crumb_hrefs):
-                if not nm or not u:
+            crumb_texts = [clean_text(text) for text in crumb_texts if clean_text(text)]
+            crumb_hrefs = [strip_tracking_parameters(response.urljoin(href)) for href in crumb_hrefs if href]
+            for name, url in zip(crumb_texts, crumb_hrefs):
+                if not name or not url:
                     continue
-                if u == source_url:
+                if url == source_url:
                     continue
-                breadcrumb_names.append(nm)
-                breadcrumb_urls.append(u)
+                breadcrumb_names.append(name)
+                breadcrumb_urls.append(url)
 
+        # Set breadcrumb fields
         if breadcrumb_names:
             item["breadcrumb_path"] = breadcrumb_names
             item["breadcrumb_urls"] = breadcrumb_urls
@@ -1057,7 +1140,8 @@ class BaxProductsSpider(scrapy.Spider):
             if len(breadcrumb_names) >= 2:
                 item["breadcrumb_parent"] = breadcrumb_names[-2]
         else:
-            url_names, url_urls = breadcrumbs_from_url(source_url)
+            # Fallback from URL
+            url_names, url_urls = extract_breadcrumbs_from_url(source_url)
             if url_names:
                 item["breadcrumb_path"] = url_names
                 item["breadcrumb_urls"] = url_urls
@@ -1066,31 +1150,31 @@ class BaxProductsSpider(scrapy.Spider):
                 if len(url_names) >= 2:
                     item["breadcrumb_parent"] = url_names[-2]
 
-
-        # HTML fallbacks
+        # HTML fallbacks for title, brand, image, description
         if not item["title"]:
             item["title"] = (
-                clean(response.css("h1::text").get())
-                or meta_content(response, "og:title")
-                or clean(response.css("title::text").get())
+                clean_text(response.css("h1::text").get())
+                or get_meta_content(response, "og:title")
+                or clean_text(response.css("title::text").get())
             )
             if item["title"]:
                 item["title"] = re.sub(r"\s*\|\s*bax\s*shop\s*$", "", item["title"], flags=re.IGNORECASE).strip()
 
         if not item["brand"]:
             item["brand"] = (
-                clean(response.css('[data-test*="brand"]::text').get())
-                or clean(response.css('a[href*="/merk/"]::text').get())
-                or meta_content(response, "product:brand")
+                clean_text(response.css('[data-test*="brand"]::text').get())
+                or clean_text(response.css('a[href*="/merk/"]::text').get())
+                or get_meta_content(response, "product:brand")
             )
 
         if not item["image_url"]:
-            item["image_url"] = meta_content(response, "og:image")
+            item["image_url"] = get_meta_content(response, "og:image")
 
         if not item["description"]:
-            item["description"] = meta_content(response, "description", "og:description")
+            item["description"] = get_meta_content(response, "description", "og:description")
 
-        specs = extract_spec_pairs(response)
+        # Extract specs from HTML
+        specs = extract_product_specs(response)
         if not item["brand"]:
             item["brand"] = find_spec_value(specs, "merk", "brand", "fabrikant")
         if not item["model"]:
@@ -1102,9 +1186,9 @@ class BaxProductsSpider(scrapy.Spider):
         if not item["gtin"]:
             item["gtin"] = find_spec_value(specs, "ean", "gtin")
 
-        # Price parsing from buybox
+        # Price parsing from buy block
         buy_block = response.css('[data-test*="buy"], [class*="buy"], form[action*="cart"]')
-        buy_text = clean(" ".join(buy_block.css("*::text").getall())) if buy_block else None
+        buy_text = clean_text(" ".join(buy_block.css("*::text").getall())) if buy_block else None
 
         if item["current_price"] is None:
             price_text = None
@@ -1115,15 +1199,15 @@ class BaxProductsSpider(scrapy.Spider):
                 if price_text:
                     price_source = "buy_block"
             if not price_text:
-                price_text = meta_content(response, "product:price:amount", "og:price:amount")
+                price_text = get_meta_content(response, "product:price:amount", "og:price:amount")
                 if price_text:
                     price_source = "meta"
             if not price_text:
-                price_text = clean(response.css('[itemprop="price"]::attr(content)').get())
+                price_text = clean_text(response.css('[itemprop="price"]::attr(content)').get())
                 if price_text:
                     price_source = "itemprop_content"
             if not price_text:
-                price_text = clean(response.css('[itemprop="price"]::text').get())
+                price_text = clean_text(response.css('[itemprop="price"]::text').get())
                 if price_text:
                     price_source = "itemprop_text"
 
@@ -1132,144 +1216,151 @@ class BaxProductsSpider(scrapy.Spider):
 
             if price_text:
                 item["price_text"] = item["price_text"] or price_text
-                item["current_price"] = price_to_float(price_text)
+                item["current_price"] = convert_price_to_float(price_text)
 
+        # Extract base price from buy text
         if buy_text:
-            cur2, base2 = extract_prices_from_buyblock_text(buy_text)
-            if cur2 is not None:
+            current_alt, base_alt = extract_prices_from_buy_block(buy_text)
+            if current_alt is not None:
                 if item["current_price"] is None:
-                    item["current_price"] = cur2
-                elif base2 is not None and item["current_price"] >= base2 and cur2 < item["current_price"]:
-                    # Prefer the lower buybox price when current looks like list price.
-                    item["current_price"] = cur2
-            if base2 is not None:
-                if item["current_price"] is None or base2 >= item["current_price"]:
-                    item["base_price"] = base2
+                    item["current_price"] = current_alt
+                elif base_alt is not None and item["current_price"] >= base_alt and current_alt < item["current_price"]:
+                    # Prefer lower buybox price
+                    item["current_price"] = current_alt
+            if base_alt is not None:
+                if item["current_price"] is None or base_alt >= item["current_price"]:
+                    item["base_price"] = base_alt
 
-            dp = parse_discount_percent(buy_text)
-            if dp is not None:
-                item["discount_percent"] = dp
+            discount_pct = parse_discount_percentage(buy_text)
+            if discount_pct is not None:
+                item["discount_percent"] = discount_pct
 
+        # Calculate discount amount
         if item["base_price"] is not None and item["current_price"] is not None:
             if item["base_price"] >= item["current_price"]:
                 item["discount_amount"] = round(item["base_price"] - item["current_price"], 2)
                 if item["discount_percent"] is None and item["base_price"] > 0:
                     item["discount_percent"] = round((item["discount_amount"] / item["base_price"]) * 100, 2)
 
-        # Availability
+        # Stock status
         if not item["stock_status_text"] or item["in_stock"] is None:
             if buy_text:
                 item["stock_status_text"] = item["stock_status_text"] or buy_text
                 if item["in_stock"] is None:
-                    low = buy_text.lower()
-                    if any(x in low for x in ["niet leverbaar", "uitverkocht", "tijdelijk niet beschikbaar"]):
+                    lower_buy_text = buy_text.lower()
+                    if any(phrase in lower_buy_text for phrase in ["niet leverbaar", "uitverkocht", "tijdelijk niet beschikbaar"]):
                         item["in_stock"] = False
-                    elif any(x in low for x in ["op voorraad", "voor 23:59", "leverbaar", "morgen"]):
+                    elif any(phrase in lower_buy_text for phrase in ["op voorraad", "voor 23:59", "leverbaar", "morgen"]):
                         item["in_stock"] = True
 
-        # Ratings fallback
+        # Rating fallback
         if not item["rating_value"] or not item["review_count"]:
-            rating_text = clean(
+            rating_text = clean_text(
                 " ".join(
                     response.css('[data-test*="rating"] *::text, a[href*="reviews"] *::text, [href*="#review"] *::text')
                     .getall()
                 )
             ) or ""
             if not item["rating_value"]:
-                m = re.search(r"\b(\d(?:[.,]\d)?)\b", rating_text)
-                if m:
-                    item["rating_value"] = m.group(1).replace(",", ".")
+                match = re.search(r"\b(\d(?:[.,]\d)?)\b", rating_text)
+                if match:
+                    item["rating_value"] = match.group(1).replace(",", ".")
             if not item["review_count"]:
-                m = re.search(r"\b(\d+)\b", rating_text)
-                if m:
-                    item["review_count"] = m.group(1)
+                match = re.search(r"\b(\d+)\b", rating_text)
+                if match:
+                    item["review_count"] = match.group(1)
 
-        full_text = clean(" ".join(response.css("body *::text").getall())) or ""
+        # Extract customer service info from page text
+        full_text = clean_text(" ".join(response.css("body *::text").getall())) or ""
 
-        if text_has_any(full_text, ["gratis verzending", "gratis bezorging", "gratis geleverd"]):
+        if text_contains_any(full_text, ["gratis verzending", "gratis bezorging", "gratis geleverd"]):
             item["shipping_included"] = True
-        elif text_has_any(full_text, ["verzendkosten", "bezorgkosten"]):
+        elif text_contains_any(full_text, ["verzendkosten", "bezorgkosten"]):
             item["shipping_included"] = False
 
-        m = re.search(
+        match = re.search(
             r"gratis\s+verzending.{0,80}?vanaf\s*€\s*([0-9]+(?:[.,][0-9]{1,2})?)",
             full_text,
             re.IGNORECASE,
         )
-        if m:
-            item["free_shipping_threshold_amt"] = price_to_float(m.group(1))
+        if match:
+            item["free_shipping_threshold_amt"] = convert_price_to_float(match.group(1))
 
-        if text_has_any(full_text, ["afhaalpunt", "ophaalpunt", "afhalen", "pickup point", "pick-up point"]):
+        if text_contains_any(full_text, ["afhaalpunt", "ophaalpunt", "afhalen", "pickup point", "pick-up point"]):
             item["pickup_point_available"] = True
 
-        if text_has_any(full_text, ["bezorgen", "bezorgd", "geleverd", "levertijd", "thuisbezorgd", "morgen in huis"]):
+        if text_contains_any(full_text, ["bezorgen", "bezorgd", "geleverd", "levertijd", "thuisbezorgd", "morgen in huis"]):
             item["delivery_shipping_available"] = True
 
-        if text_has_any(full_text, ["postnl", "dhl", "dpd", "ups", "gls", "bezorger", "koerier"]):
+        if text_contains_any(full_text, ["postnl", "dhl", "dpd", "ups", "gls", "bezorger", "koerier"]):
             item["delivery_courier_available"] = True
 
-        m = re.search(r"(\d+)\s*dagen\s*bedenktijd", full_text, re.IGNORECASE)
-        if m:
-            item["cooling_off_days"] = int(m.group(1))
+        match = re.search(r"(\d+)\s*dagen\s*bedenktijd", full_text, re.IGNORECASE)
+        if match:
+            item["cooling_off_days"] = int(match.group(1))
 
-        if text_has_any(full_text, ["gratis retourneren", "gratis retour", "kosteloos retourneren", "gratis terugsturen"]):
+        if text_contains_any(full_text, ["gratis retourneren", "gratis retour", "kosteloos retourneren", "gratis terugsturen"]):
             item["free_returns"] = True
 
-        m = re.search(r"(\d+)\s*(jaar|jaren)\s*garantie", full_text, re.IGNORECASE)
-        if m:
-            item["warranty_duration_months"] = int(m.group(1)) * 12
+        match = re.search(r"(\d+)\s*(jaar|jaren)\s*garantie", full_text, re.IGNORECASE)
+        if match:
+            item["warranty_duration_months"] = int(match.group(1)) * 12
         else:
-            m = re.search(r"(\d+)\s*(maand|maanden)\s*garantie", full_text, re.IGNORECASE)
-            if m:
-                item["warranty_duration_months"] = int(m.group(1))
+            match = re.search(r"(\d+)\s*(maand|maanden)\s*garantie", full_text, re.IGNORECASE)
+            if match:
+                item["warranty_duration_months"] = int(match.group(1))
 
-        if item["warranty_duration_months"] is not None and text_has_any(full_text, ["bax", "bax music", "bax-shop"]):
+        if item["warranty_duration_months"] is not None and text_contains_any(full_text, ["bax", "bax music", "bax-shop"]):
             item["warranty_provider"] = "Bax Music"
 
-        for h in response.css("a::attr(href)").getall():
-            if not h:
+        # Find customer service URL
+        for href in response.css("a::attr(href)").getall():
+            if not href:
                 continue
-            u = response.urljoin(h)
-            ul = u.lower()
-            if "bax-shop.nl" not in ul:
+            url = response.urljoin(href)
+            lower_url = url.lower()
+            if "bax-shop.nl" not in lower_url:
                 continue
-            if "/klantenservice" in ul or "/service" in ul or "/contact" in ul:
-                item["customer_service_url"] = u
+            if "/klantenservice" in lower_url or "/service" in lower_url or "/contact" in lower_url:
+                item["customer_service_url"] = url
                 break
 
-        # Identifier fallbacks
+        # Identifier fallbacks from text
         if not item["gtin"] or not item["mpn"] or not item["model"]:
             body_text = full_text or ""
 
             if not item["gtin"]:
-                m = re.search(r"\b(EAN|GTIN)\b\D{0,30}(\d{8,14})\b", body_text, re.IGNORECASE)
-                if m:
-                    item["gtin"] = m.group(2)
+                match = re.search(r"\b(EAN|GTIN)\b\D{0,30}(\d{8,14})\b", body_text, re.IGNORECASE)
+                if match:
+                    item["gtin"] = match.group(2)
 
             if not item["mpn"]:
-                m = re.search(
+                match = re.search(
                     r"\b(MPN|Artikelnummer|Part number|Onderdeelnummer)\b\D{0,30}([A-Z0-9][A-Z0-9\-_\/\.]{2,})",
                     body_text,
                     re.IGNORECASE,
                 )
-                if m:
-                    item["mpn"] = m.group(2)
+                if match:
+                    item["mpn"] = match.group(2)
 
             if not item["model"]:
-                m = re.search(
+                match = re.search(
                     r"\b(Model|Modelnummer|Typenummer)\b\D{0,30}([A-Z0-9][A-Z0-9\-_\/\.]{2,})",
                     body_text,
                     re.IGNORECASE,
                 )
-                if m and re.search(r"\d", m.group(2)):
-                    item["model"] = m.group(2)
+                if match and re.search(r"\d", match.group(2)):
+                    item["model"] = match.group(2)
 
-        item["model"] = normalize_bad_model(item["model"])
+        # Normalize model
+        item["model"] = normalize_model_name(item["model"])
+        # Create canonical name
         item["canonical_name"] = (
-            canonicalize(item["brand"], item["title"], item["model"])
-            or canonicalize(None, item["title"], None)
+            create_canonical_name(item["brand"], item["title"], item["model"])
+            or create_canonical_name(None, item["title"], None)
         )
 
+        # Validate rating
         if item["rating_value"]:
             try:
                 if float(item["rating_value"]) > item["rating_scale"]:
@@ -1280,6 +1371,7 @@ class BaxProductsSpider(scrapy.Spider):
         yield item
 
     def _should_render_with_selenium(self, response):
+        """Check if page needs Selenium rendering."""
         if not self.use_selenium or response.meta.get("selenium_rendered"):
             return False
         if response.status != 200:
@@ -1289,6 +1381,7 @@ class BaxProductsSpider(scrapy.Spider):
         return bool(response.css(".product-results, .product-result-overview"))
 
     def _render_with_selenium(self, response):
+        """Render page with Selenium if needed."""
         driver = self._ensure_selenium_driver()
         if not driver:
             return None
@@ -1312,6 +1405,7 @@ class BaxProductsSpider(scrapy.Spider):
             return None
 
     def _load_all_products(self, driver):
+        """Load all products by clicking load more buttons."""
         prev_count = self._count_product_tiles(driver)
         for _ in range(8):
             if not self._click_any_load_more(driver):
@@ -1325,6 +1419,7 @@ class BaxProductsSpider(scrapy.Spider):
         time.sleep(0.5)
 
     def _click_any_load_more(self, driver):
+        """Click load more button if available."""
         try:
             from selenium.common.exceptions import WebDriverException
             from selenium.webdriver.common.by import By
@@ -1356,6 +1451,7 @@ class BaxProductsSpider(scrapy.Spider):
         return False
 
     def _count_product_tiles(self, driver):
+        """Count product tiles on page."""
         try:
             from selenium.webdriver.common.by import By
             tiles = driver.find_elements(By.CSS_SELECTOR, ".result, .product-container")
@@ -1364,6 +1460,7 @@ class BaxProductsSpider(scrapy.Spider):
             return 0
 
     def _wait_for_listing(self, driver, timeout=25):
+        """Wait for listing to load."""
         try:
             from selenium.webdriver.common.by import By
             from selenium.webdriver.support import expected_conditions as EC
@@ -1378,6 +1475,7 @@ class BaxProductsSpider(scrapy.Spider):
             self.logger.debug("selenium listing wait timed out url=%s", driver.current_url)
 
     def _ensure_selenium_driver(self):
+        """Initialize Selenium driver."""
         if self._selenium_driver:
             return self._selenium_driver
         try:
@@ -1410,6 +1508,7 @@ class BaxProductsSpider(scrapy.Spider):
             return None
 
     def closed(self, reason):
+        """Cleanup on spider close."""
         if self._selenium_driver:
             try:
                 self._selenium_driver.quit()
