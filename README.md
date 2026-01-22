@@ -22,12 +22,20 @@ We built a Python-based scraping system that collects and standardizes microphon
 Each team member is responsible for specific components of the project: 
 
 - Luuk Hoogeveen: Bax products spider
+Input: bax_products.py
+Output: bax_products.json
+DB store: bax db load.ipynb
 
 - Fedde Koster: Maxiaxi products spider
 
 - Vanna Pušić: Thomann products spider 
 
 - Iro Chrysospathi: Bol products/support spider 
+Input: bol_products.py
+Output: bol_products.jsonl
+Input: bol_support.py
+Output: bol_support.jsonl
+DB store: bol_visualization.ipynb
 
 ## Execution 
 Instructions for spider execution: 
